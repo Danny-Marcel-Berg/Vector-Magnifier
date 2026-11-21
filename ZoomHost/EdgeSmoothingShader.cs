@@ -1,0 +1,533 @@
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using Vortice.D3DCompiler;
+using Vortice.Direct3D;
+using Vortice.Direct3D11;
+using Vortice.DXGI;
+
+namespace ZoomHost;
+
+/// <summary>
+/// GPU text magnifier (see Shaders/EdgeSmoothing.hlsl for the algorithm).
+/// <list type="number">
+/// <item>Pole pass (desktop resolution, visible crop only, re-run when the desktop or the
+/// viewport changes): ink/background colours, local luminance extremes and text confidence.</item>
+/// <item>Magnify pass (screen resolution, every frame): crisp, anti-aliased contour reconstruction.</item>
+/// </list>
+/// </summary>
+public sealed class EdgeSmoothingShader : IDisposable
+{
+    private const string HlslResourceName = "ZoomHost.Shaders.EdgeSmoothing.hlsl";
+    private const string HlslSourceName = "EdgeSmoothing.hlsl";
+
+    /// <summary>At or below this zoom the shader samples bilinearly and needs no pole pass.</summary>
+    private const float PassthroughZoom = 1.05f;
+
+    /// <summary>Extra texels around the visible area: bilinear pole footprint (1) plus safety.</summary>
+    private const int ViewMargin = 4;
+
+    // Must match the cbuffer "Params" layout in EdgeSmoothing.hlsl (16-byte aligned, 64 bytes).
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ShaderParams
+    {
+        public float FocusX;
+        public float FocusY;
+        public float Zoom;
+        public float Sharpness;
+        public float ScreenWidth;
+        public float ScreenHeight;
+        public float DesktopWidth;
+        public float DesktopHeight;
+        public float TextGamma;
+        public float IsHdr;
+        public float SdrWhiteScale;
+        public float InvertColors;
+        public float CropMinU;
+        public float CropMinV;
+        public float CropMaxU;
+        public float CropMaxV;
+    }
+
+    // Must match the cbuffer "CursorParams" layout in EdgeSmoothing.hlsl (16-byte aligned, 64 bytes).
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CursorShaderParams
+    {
+        public float CursorX;
+        public float CursorY;
+        public float CursorScale;
+        public float StrokeHalfWidth;
+        public float ScreenWidth;
+        public float ScreenHeight;
+        private float _pad0;
+        private float _pad1;
+        public float FillR, FillG, FillB, FillA;
+        public float StrokeR, StrokeG, StrokeB, StrokeA;
+    }
+
+    private readonly record struct ShaderBytecode(byte[] Vs, byte[] VsCrop, byte[] PsPole, byte[] Ps, byte[] VsCursor, byte[] PsCursor);
+
+    private readonly record struct RenderTarget(ID3D11Texture2D Texture, ID3D11RenderTargetView Rtv, ID3D11ShaderResourceView Srv) : IDisposable
+    {
+        public void Dispose()
+        {
+            Srv.Dispose();
+            Rtv.Dispose();
+            Texture.Dispose();
+        }
+    }
+
+    private readonly ID3D11Device _device;
+    private readonly ID3D11DeviceContext _context;
+    private readonly ID3D11VertexShader _vs;
+    private readonly ID3D11VertexShader _vsCrop;
+    private readonly ID3D11PixelShader _psPole;
+    private readonly ID3D11PixelShader _ps;
+    private readonly ID3D11VertexShader _vsCursor;
+    private readonly ID3D11PixelShader _psCursor;
+    private readonly ID3D11Buffer _constantBuffer;
+    private readonly ID3D11Buffer _cursorConstantBuffer;
+    private readonly ID3D11SamplerState _linearSampler;
+    private readonly ID3D11BlendState _opaqueBlendState;
+    private readonly ID3D11BlendState _alphaBlendState;
+    private readonly ID3D11RasterizerState _noCullRasterizerState;
+
+    private ID3D11Texture2D? _trackedTexture;
+    private ID3D11ShaderResourceView? _desktopSrv;
+
+    // Pole pass outputs (t1..t3 in the magnify pass).
+    private RenderTarget? _poleDark;
+    private RenderTarget? _poleLight;
+    private RenderTarget? _localExt;
+    private int _poleWidth;
+    private int _poleHeight;
+    private Format _poleFormat;
+
+    private bool _hasPoles;
+    private long _polesDesktopVersion = -1;
+    private int _polesX0, _polesY0, _polesX1, _polesY1;
+    private bool _disposed;
+
+    public EdgeSmoothingShader(ID3D11Device device, ID3D11DeviceContext context)
+    {
+        _device = device;
+        _context = context;
+
+        ShaderBytecode bytecode = LoadOrCompileShaders();
+        _vs = _device.CreateVertexShader(bytecode.Vs);
+        _vsCrop = _device.CreateVertexShader(bytecode.VsCrop);
+        _psPole = _device.CreatePixelShader(bytecode.PsPole);
+        _ps = _device.CreatePixelShader(bytecode.Ps);
+        _vsCursor = _device.CreateVertexShader(bytecode.VsCursor);
+        _psCursor = _device.CreatePixelShader(bytecode.PsCursor);
+
+        _constantBuffer = _device.CreateBuffer(new BufferDescription
+        {
+            ByteWidth = (uint)Marshal.SizeOf<ShaderParams>(),
+            Usage = ResourceUsage.Dynamic,
+            BindFlags = BindFlags.ConstantBuffer,
+            CPUAccessFlags = CpuAccessFlags.Write
+        });
+
+        _cursorConstantBuffer = _device.CreateBuffer(new BufferDescription
+        {
+            ByteWidth = (uint)Marshal.SizeOf<CursorShaderParams>(),
+            Usage = ResourceUsage.Dynamic,
+            BindFlags = BindFlags.ConstantBuffer,
+            CPUAccessFlags = CpuAccessFlags.Write
+        });
+
+        _linearSampler = _device.CreateSamplerState(new SamplerDescription
+        {
+            Filter = Filter.MinMagMipLinear,
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp,
+            MaxLOD = float.MaxValue
+        });
+
+        _opaqueBlendState = _device.CreateBlendState(BlendDescription.Opaque);
+        _alphaBlendState = _device.CreateBlendState(BlendDescription.NonPremultiplied);
+        _noCullRasterizerState = _device.CreateRasterizerState(new RasterizerDescription(CullMode.None, FillMode.Solid));
+    }
+
+    public void Render(
+        ID3D11RenderTargetView rtv,
+        ID3D11Texture2D desktopTexture,
+        CameraController camera,
+        int desktopWidth,
+        int desktopHeight,
+        float sharpness = 0.0f,
+        float gammaBoost = 0.0f,
+        bool isHdr = false,
+        float sdrWhiteScale = 1.0f,
+        long desktopVersion = -1,
+        bool invertColors = false)
+    {
+        if (_disposed)
+        {
+            return; // Render loop may still tick once during shutdown.
+        }
+
+        if (!ReferenceEquals(_trackedTexture, desktopTexture) || _desktopSrv is null)
+        {
+            _desktopSrv?.Dispose();
+            _trackedTexture = desktopTexture;
+            _desktopSrv = _device.CreateShaderResourceView(desktopTexture);
+            _hasPoles = false;
+        }
+
+        _context.IASetInputLayout(null);
+        _context.RSSetState(_noCullRasterizerState);
+        _context.OMSetBlendState(_opaqueBlendState);
+        _context.VSSetConstantBuffer(0, _constantBuffer);
+        _context.PSSetConstantBuffer(0, _constantBuffer);
+        _context.PSSetSampler(1, _linearSampler);
+
+        if (camera.Zoom > PassthroughZoom)
+        {
+            EnsurePoleTargets(desktopWidth, desktopHeight, isHdr);
+            UpdatePolesIfNeeded(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, desktopVersion);
+        }
+
+        // Magnify pass
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, invertColors,
+            _polesX0, _polesY0, _polesX1, _polesY1);
+        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        _context.RSSetViewport(0, 0, camera.ScreenWidth, camera.ScreenHeight);
+        _context.OMSetRenderTargets(rtv);
+        _context.VSSetShader(_vs);
+        _context.PSSetShader(_ps);
+        _context.PSSetShaderResource(0, _desktopSrv);
+        if (camera.Zoom > PassthroughZoom)
+        {
+            _context.PSSetShaderResource(1, _poleDark!.Value.Srv);
+            _context.PSSetShaderResource(2, _poleLight!.Value.Srv);
+            _context.PSSetShaderResource(3, _localExt!.Value.Srv);
+        }
+        _context.Draw(3, 0);
+
+        UnbindShaderResources();
+        _context.OMSetRenderTargets((ID3D11RenderTargetView)null!);
+    }
+
+    public unsafe void RenderCursor(
+        ID3D11RenderTargetView rtv,
+        float screenWidth,
+        float screenHeight,
+        float cursorScreenX,
+        float cursorScreenY,
+        float cursorScale,
+        bool invertCursor,
+        bool isHdr,
+        float sdrWhiteScale)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        float fillSrgb = invertCursor ? 0.03f : 1.0f;
+        float strokeSrgb = invertCursor ? 1.0f : 0.05f;
+        float fill = isHdr ? SrgbToLinear(fillSrgb) * sdrWhiteScale : fillSrgb;
+        float stroke = isHdr ? SrgbToLinear(strokeSrgb) * sdrWhiteScale : strokeSrgb;
+
+        MappedSubresource mapped = _context.Map(_cursorConstantBuffer, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None);
+        try
+        {
+            CursorShaderParams* p = (CursorShaderParams*)mapped.DataPointer;
+            p->CursorX = cursorScreenX;
+            p->CursorY = cursorScreenY;
+            p->CursorScale = cursorScale;
+            p->StrokeHalfWidth = 0.625f;
+            p->ScreenWidth = screenWidth;
+            p->ScreenHeight = screenHeight;
+            p->FillR = fill; p->FillG = fill; p->FillB = fill; p->FillA = 1.0f;
+            p->StrokeR = stroke; p->StrokeG = stroke; p->StrokeB = stroke; p->StrokeA = 1.0f;
+        }
+        finally
+        {
+            _context.Unmap(_cursorConstantBuffer, 0);
+        }
+
+        _context.IASetInputLayout(null);
+        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+        _context.RSSetState(_noCullRasterizerState);
+        _context.RSSetViewport(0, 0, screenWidth, screenHeight);
+        _context.OMSetBlendState(_alphaBlendState);
+        _context.OMSetRenderTargets(rtv);
+        _context.VSSetConstantBuffer(1, _cursorConstantBuffer);
+        _context.PSSetConstantBuffer(1, _cursorConstantBuffer);
+        _context.VSSetShader(_vsCursor);
+        _context.PSSetShader(_psCursor);
+        _context.Draw(4, 0);
+        _context.OMSetBlendState(_opaqueBlendState);
+        _context.OMSetRenderTargets((ID3D11RenderTargetView)null!);
+    }
+
+    private static float SrgbToLinear(float c)
+    {
+        float clamped = Math.Clamp(c, 0.0f, 1.0f);
+        return clamped <= 0.04045f ? clamped / 12.92f : MathF.Pow((clamped + 0.055f) / 1.055f, 2.4f);
+    }
+
+    private void UpdatePolesIfNeeded(
+        CameraController camera, int desktopWidth, int desktopHeight,
+        float sharpness, float gammaBoost, bool isHdr, float sdrWhiteScale, long desktopVersion)
+    {
+        // Visible desktop rectangle (texels) plus the footprint the magnify pass reads.
+        float halfW = camera.ScreenWidth * 0.5f / camera.Zoom;
+        float halfH = camera.ScreenHeight * 0.5f / camera.Zoom;
+        int reqX0 = Math.Clamp((int)MathF.Floor(camera.FocusX - halfW) - ViewMargin, 0, desktopWidth);
+        int reqY0 = Math.Clamp((int)MathF.Floor(camera.FocusY - halfH) - ViewMargin, 0, desktopHeight);
+        int reqX1 = Math.Clamp((int)MathF.Ceiling(camera.FocusX + halfW) + ViewMargin, 0, desktopWidth);
+        int reqY1 = Math.Clamp((int)MathF.Ceiling(camera.FocusY + halfH) + ViewMargin, 0, desktopHeight);
+
+        bool upToDate = _hasPoles &&
+            desktopVersion >= 0 &&
+            desktopVersion == _polesDesktopVersion &&
+            reqX0 >= _polesX0 && reqY0 >= _polesY0 && reqX1 <= _polesX1 && reqY1 <= _polesY1;
+        if (upToDate)
+        {
+            return;
+        }
+
+        // Prepare a bit more than visible so small pans do not trigger a new pole pass.
+        int panSlack = camera.Zoom >= 8.0f ? 128 : camera.Zoom >= 4.0f ? 72 : camera.Zoom >= 2.5f ? 32 : 16;
+        int x0 = Math.Clamp(reqX0 - panSlack, 0, desktopWidth);
+        int y0 = Math.Clamp(reqY0 - panSlack, 0, desktopHeight);
+        int x1 = Math.Clamp(reqX1 + panSlack, 0, desktopWidth);
+        int y1 = Math.Clamp(reqY1 + panSlack, 0, desktopHeight);
+
+        UnbindShaderResources();
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, x0, y0, x1, y1);
+        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+        _context.RSSetViewport(0, 0, desktopWidth, desktopHeight);
+        _context.OMSetRenderTargets([_poleDark!.Value.Rtv, _poleLight!.Value.Rtv, _localExt!.Value.Rtv]);
+        _context.VSSetShader(_vsCrop);
+        _context.PSSetShader(_psPole);
+        _context.PSSetShaderResource(0, _desktopSrv!);
+        _context.Draw(4, 0);
+        _context.OMSetRenderTargets([(ID3D11RenderTargetView)null!, null!, null!]);
+
+        (_polesX0, _polesY0, _polesX1, _polesY1) = (x0, y0, x1, y1);
+        _polesDesktopVersion = desktopVersion;
+        _hasPoles = true;
+    }
+
+    private void UnbindShaderResources()
+    {
+        // Literal slots compile against both int and uint overloads of the Vortice API.
+        _context.PSSetShaderResource(0, null!);
+        _context.PSSetShaderResource(1, null!);
+        _context.PSSetShaderResource(2, null!);
+        _context.PSSetShaderResource(3, null!);
+    }
+
+    private void EnsurePoleTargets(int desktopWidth, int desktopHeight, bool isHdr)
+    {
+        // PolePS always outputs perceptual sRGB [0, 1] (converting HDR linear scRGB via exact
+        // inverse Windows piecewise sRGB OETF), so 8-bit UNorm is exact and halves VRAM bandwidth.
+        _ = isHdr;
+        Format format = Format.R8G8B8A8_UNorm;
+        if (_poleDark is not null && _poleWidth == desktopWidth && _poleHeight == desktopHeight && _poleFormat == format)
+        {
+            return;
+        }
+
+        ReleasePoleTargets();
+
+        Texture2DDescription desc = new()
+        {
+            Width = (uint)Math.Max(1, desktopWidth),
+            Height = (uint)Math.Max(1, desktopHeight),
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = format,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource
+        };
+
+        _poleDark = CreateRenderTarget(desc);
+        _poleLight = CreateRenderTarget(desc);
+        // LocalExt stores only normalised [0, 1] tangent/ClearType/localC data, so 8-bit UNorm
+        // is always exact and cuts pole-pass HDR VRAM bandwidth by a third.
+        Texture2DDescription localDesc = desc;
+        localDesc.Format = Format.R8G8B8A8_UNorm;
+        _localExt = CreateRenderTarget(localDesc);
+        (_poleWidth, _poleHeight, _poleFormat) = (desktopWidth, desktopHeight, format);
+        _hasPoles = false;
+    }
+
+    private RenderTarget CreateRenderTarget(Texture2DDescription desc)
+    {
+        ID3D11Texture2D texture = _device.CreateTexture2D(desc);
+        return new RenderTarget(texture, _device.CreateRenderTargetView(texture), _device.CreateShaderResourceView(texture));
+    }
+
+    private void ReleasePoleTargets()
+    {
+        _poleDark?.Dispose(); _poleDark = null;
+        _poleLight?.Dispose(); _poleLight = null;
+        _localExt?.Dispose(); _localExt = null;
+        _hasPoles = false;
+    }
+
+    private unsafe void WriteConstants(
+        CameraController camera, int desktopWidth, int desktopHeight,
+        float sharpness, float gammaBoost, bool isHdr, float sdrWhiteScale, bool invertColors,
+        int cropX0, int cropY0, int cropX1, int cropY1)
+    {
+        float invW = 1.0f / Math.Max(1, desktopWidth);
+        float invH = 1.0f / Math.Max(1, desktopHeight);
+
+        MappedSubresource mapped = _context.Map(_constantBuffer, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None);
+        try
+        {
+            ShaderParams* p = (ShaderParams*)mapped.DataPointer;
+            p->FocusX = camera.FocusX;
+            p->FocusY = camera.FocusY;
+            p->Zoom = camera.Zoom;
+            p->Sharpness = Math.Clamp(sharpness, 0.0f, 1.0f);
+            p->ScreenWidth = camera.ScreenWidth;
+            p->ScreenHeight = camera.ScreenHeight;
+            p->DesktopWidth = desktopWidth;
+            p->DesktopHeight = desktopHeight;
+            p->TextGamma = Math.Clamp(gammaBoost, 0.0f, 1.0f);
+            p->IsHdr = isHdr ? 1.0f : 0.0f;
+            p->SdrWhiteScale = MathF.Max(0.25f, sdrWhiteScale);
+            p->InvertColors = invertColors ? 1.0f : 0.0f;
+            p->CropMinU = cropX0 * invW;
+            p->CropMinV = cropY0 * invH;
+            p->CropMaxU = cropX1 * invW;
+            p->CropMaxV = cropY1 * invH;
+        }
+        finally
+        {
+            _context.Unmap(_constantBuffer, 0);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+
+        ReleasePoleTargets();
+        _desktopSrv?.Dispose();
+        _noCullRasterizerState.Dispose();
+        _alphaBlendState.Dispose();
+        _opaqueBlendState.Dispose();
+        _linearSampler.Dispose();
+        _cursorConstantBuffer.Dispose();
+        _constantBuffer.Dispose();
+        _psCursor.Dispose();
+        _vsCursor.Dispose();
+        _ps.Dispose();
+        _psPole.Dispose();
+        _vsCrop.Dispose();
+        _vs.Dispose();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Shader loading: HLSL is an embedded resource; compiled bytecode is cached per source hash
+    // in %LocalAppData%\ZoomText_Clone\ShaderCache so only the first start compiles.
+    // ---------------------------------------------------------------------------------------
+
+    private static ShaderBytecode LoadOrCompileShaders()
+    {
+        string source = ReadEmbeddedHlsl();
+        string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
+        string cacheDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ZoomText_Clone",
+            "ShaderCache");
+
+        string[] paths = ["vs", "vscrop", "pspole", "ps", "vscursor", "pscursor"];
+        for (int i = 0; i < paths.Length; i++)
+        {
+            paths[i] = Path.Combine(cacheDir, $"{paths[i]}_{hash}.cso");
+        }
+
+        if (TryReadCache(paths, out ShaderBytecode cached))
+        {
+            return cached;
+        }
+
+        byte[] vs = [], vsCrop = [], psPole = [], ps = [], vsCursor = [], psCursor = [];
+        System.Threading.Tasks.Parallel.Invoke(
+            () => vs = Compile(source, "VSMain", "vs_5_0"),
+            () => vsCrop = Compile(source, "VSCropMain", "vs_5_0"),
+            () => psPole = Compile(source, "PolePS", "ps_5_0"),
+            () => ps = Compile(source, "PSMain", "ps_5_0"),
+            () => vsCursor = Compile(source, "VSCursor", "vs_5_0"),
+            () => psCursor = Compile(source, "PSCursor", "ps_5_0"));
+        ShaderBytecode compiled = new(vs, vsCrop, psPole, ps, vsCursor, psCursor);
+
+        try
+        {
+            Directory.CreateDirectory(cacheDir);
+            File.WriteAllBytes(paths[0], compiled.Vs);
+            File.WriteAllBytes(paths[1], compiled.VsCrop);
+            File.WriteAllBytes(paths[2], compiled.PsPole);
+            File.WriteAllBytes(paths[3], compiled.Ps);
+            File.WriteAllBytes(paths[4], compiled.VsCursor);
+            File.WriteAllBytes(paths[5], compiled.PsCursor);
+        }
+        catch (IOException)
+        {
+            // Cache is an optimisation only.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        return compiled;
+    }
+
+    private static bool TryReadCache(string[] paths, out ShaderBytecode bytecode)
+    {
+        bytecode = default;
+        try
+        {
+            if (!paths.All(File.Exists))
+            {
+                return false;
+            }
+
+            byte[][] data = paths.Select(File.ReadAllBytes).ToArray();
+            if (data.Any(d => d.Length == 0))
+            {
+                return false;
+            }
+
+            bytecode = new ShaderBytecode(data[0], data[1], data[2], data[3], data[4], data[5]);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static byte[] Compile(string source, string entryPoint, string profile) =>
+        Compiler.Compile(source, entryPoint, HlslSourceName, profile, ShaderFlags.OptimizationLevel1).ToArray();
+
+    private static string ReadEmbeddedHlsl()
+    {
+        using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(HlslResourceName)
+            ?? throw new InvalidOperationException($"Embedded shader resource '{HlslResourceName}' is missing.");
+        using StreamReader reader = new(stream, Encoding.UTF8);
+        return reader.ReadToEnd();
+    }
+}

@@ -1,0 +1,346 @@
+<Window x:Class="ZoomHost.ControlPanelWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ZoomHost – Einstellungen"
+        SizeToContent="WidthAndHeight"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="SingleBorderWindow"
+        ResizeMode="CanMinimize"
+        Background="#FF16181E"
+        ShowInTaskbar="True">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled"
+                  MaxHeight="760">
+    <Grid Width="340" Margin="14,12,14,14">
+        <Grid.LayoutTransform>
+            <ScaleTransform x:Name="UiScaleTransform" ScaleX="1.0" ScaleY="1.0"/>
+        </Grid.LayoutTransform>
+
+        <StackPanel>
+            <!-- Statuszeile / Einklappen -->
+            <Border Background="#FF1E222B"
+                    BorderBrush="#FF323846"
+                    BorderThickness="1"
+                    CornerRadius="6"
+                    Padding="10,8"
+                    Margin="0,0,0,10">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock x:Name="ZoomValueText"
+                               Text="Zoom: 1.0x"
+                               Foreground="#FF60A5FA"
+                               FontSize="17"
+                               FontWeight="Bold"
+                               VerticalAlignment="Center"/>
+                    <TextBlock x:Name="CompactZoomText"
+                               Grid.Column="1"
+                               Text="1.0x"
+                               Foreground="#FF94A3B8"
+                               FontSize="12"
+                               FontWeight="SemiBold"
+                               VerticalAlignment="Center"
+                               Margin="0,0,8,0"/>
+                    <Button x:Name="CollapseButton"
+                            Grid.Column="2"
+                            Content="▾"
+                            Width="28"
+                            Height="24"
+                            FontSize="12"
+                            Background="#FF252A36"
+                            Foreground="#FFF5F7FA"
+                            BorderBrush="#FF3B4254"
+                            ToolTip="Einstellungen einklappen / ausklappen"
+                            Click="ToggleCollapse_Click"/>
+                </Grid>
+            </Border>
+
+            <StackPanel x:Name="MainContentPanel">
+
+                <!-- Sektion 1: Zoom -->
+                <GroupBox Header="Vergrößerung"
+                          Foreground="#FFE2E8F0"
+                          BorderBrush="#FF323846"
+                          FontWeight="SemiBold"
+                          Padding="8,8,8,6"
+                          Margin="0,0,0,10">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="1.4*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <Button Grid.Column="0"
+                                    Content="-"
+                                    ToolTip="Verkleinern"
+                                    Height="30"
+                                    FontSize="16"
+                                    FontWeight="Bold"
+                                    Background="#FF252A36"
+                                    Foreground="#FFF5F7FA"
+                                    BorderBrush="#FF3B4254"
+                                    Click="ZoomOut_Click"/>
+
+                            <Button Grid.Column="2"
+                                    Content="+"
+                                    ToolTip="Vergrößern"
+                                    Height="30"
+                                    FontSize="16"
+                                    FontWeight="Bold"
+                                    Background="#FF252A36"
+                                    Foreground="#FFF5F7FA"
+                                    BorderBrush="#FF3B4254"
+                                    Click="ZoomIn_Click"/>
+
+                            <Button Grid.Column="4"
+                                    Content="Reset (1.0x)"
+                                    Height="30"
+                                    FontSize="12"
+                                    Background="#FF252A36"
+                                    Foreground="#FFF5F7FA"
+                                    BorderBrush="#FF3B4254"
+                                    Click="ResetZoom_Click"/>
+                        </Grid>
+
+                        <!-- UI-Größe (100% - 250%) -->
+                        <Grid Margin="0,2,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Dialog-Größe"
+                                       Foreground="#FFE2E8F0"
+                                       FontWeight="Normal"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="UiScaleText"
+                                       Grid.Column="1"
+                                       Text="100%"
+                                       Foreground="#FF60A5FA"
+                                       FontWeight="SemiBold"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </Grid>
+                        <Slider x:Name="UiScaleSlider"
+                                Minimum="1.0"
+                                Maximum="2.5"
+                                Value="1.0"
+                                TickFrequency="0.25"
+                                SmallChange="0.1"
+                                LargeChange="0.25"
+                                Margin="0,0,0,6"
+                                ValueChanged="UiScaleSlider_ValueChanged"/>
+
+                        <TextBlock Text="Alt++ / Alt+- • Strg+Alt+Mausrad • Strg+Alt+0 • Strg+Alt+I"
+                                   Foreground="#FF8B94A7"
+                                   FontSize="11"
+                                   FontWeight="Normal"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <!-- Sektion 2: Kantenglättung -->
+                <GroupBox Header="Kantenglättung"
+                          Foreground="#FFE2E8F0"
+                          BorderBrush="#FF323846"
+                          FontWeight="SemiBold"
+                          Padding="8,8,8,6"
+                          Margin="0,0,0,10">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Kantenglättung (0 = Basis)"
+                                       Foreground="#FFE2E8F0"
+                                       FontWeight="Normal"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="EdgeSmoothingValueText"
+                                       Grid.Column="1"
+                                       Text="0"
+                                       Foreground="#FF60A5FA"
+                                       FontWeight="SemiBold"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </Grid>
+                        <Slider x:Name="EdgeSmoothingSlider"
+                                Minimum="0"
+                                Maximum="100"
+                                Value="0"
+                                TickFrequency="1"
+                                IsSnapToTickEnabled="True"
+                                SmallChange="1"
+                                LargeChange="10"
+                                ToolTip="0 = Basis-Schärfe; bis 100 = maximale Kantenglättung für Kurven, Schriften &amp; Icons"
+                                ValueChanged="EdgeSmoothingSlider_ValueChanged"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <!-- Sektion 3: Text-Gamma -->
+                <GroupBox Header="Text-Gamma"
+                          Foreground="#FFE2E8F0"
+                          BorderBrush="#FF323846"
+                          FontWeight="SemiBold"
+                          Padding="8,8,8,6"
+                          Margin="0,0,0,10">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Text-Gamma (0 = Normal)"
+                                       Foreground="#FFE2E8F0"
+                                       FontWeight="Normal"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="GammaValueText"
+                                       Grid.Column="1"
+                                       Text="0 (Normal)"
+                                       Foreground="#FF60A5FA"
+                                       FontWeight="SemiBold"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </Grid>
+                        <Slider x:Name="GammaSlider"
+                                Minimum="0"
+                                Maximum="100"
+                                Value="0"
+                                TickFrequency="1"
+                                IsSnapToTickEnabled="True"
+                                SmallChange="1"
+                                LargeChange="5"
+                                ToolTip="0 = normaler Text-Gamma; höher = minimal verstärkter Gamma-Wert nur für Text (Gesamtbild unverändert)"
+                                ValueChanged="GammaSlider_ValueChanged"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <!-- Sektion 3: Schrift & Vektoren -->
+                <GroupBox Header="Schrift &amp; Vektoren"
+                          Foreground="#FFE2E8F0"
+                          BorderBrush="#FF323846"
+                          FontWeight="SemiBold"
+                          Padding="8,8,8,6"
+                          Margin="0,0,0,12">
+                    <StackPanel>
+                        <CheckBox x:Name="VectorTextEnabledCheckBox"
+                                  Content="Vektor-Textschärfung aktiv"
+                                  IsChecked="True"
+                                  Foreground="#FFE2E8F0"
+                                  FontWeight="Normal"
+                                  FontSize="12"
+                                  Checked="VectorTextEnabled_Changed"
+                                  Unchecked="VectorTextEnabled_Changed"/>
+                        <CheckBox x:Name="InvertColorsCheckBox"
+                                  Content="Farben invertieren (Strg+Alt+I)"
+                                  IsChecked="False"
+                                  Foreground="#FFE2E8F0"
+                                  FontWeight="Normal"
+                                  FontSize="12"
+                                  Margin="0,6,0,0"
+                                  ToolTip="Invertiert alle Bildschirmfarben (Weiß wird Schwarz, Schwarz wird Weiß) – auch per Strg+Alt+I umschaltbar"
+                                  Checked="InvertColors_Changed"
+                                  Unchecked="InvertColors_Changed"/>
+                        <TextBlock x:Name="HookStatusText"
+                                   Text="Hook-Status: Bereit | Empfangene Texte: 0"
+                                   Foreground="#FF94A3B8"
+                                   FontSize="11"
+                                   FontWeight="Normal"
+                                   TextWrapping="Wrap"
+                                   Margin="0,6,0,0"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <!-- Sektion 4: Maus & Fokus -->
+                <GroupBox Header="Maus &amp; Fokus"
+                          Foreground="#FFE2E8F0"
+                          BorderBrush="#FF323846"
+                          FontWeight="SemiBold"
+                          Padding="8,8,8,6"
+                          Margin="0,0,0,12">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,2">
+                            <TextBlock Text="Mausgröße:"
+                                       Foreground="#FFCBD5E1"
+                                       FontWeight="Normal"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="MouseSizeValueText"
+                                       HorizontalAlignment="Right"
+                                       Text="100 %"
+                                       Foreground="#FF60A5FA"
+                                       FontWeight="SemiBold"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </Grid>
+                        <Slider x:Name="MouseSizeSlider"
+                                Minimum="50"
+                                Maximum="300"
+                                Value="100"
+                                TickFrequency="10"
+                                IsSnapToTickEnabled="True"
+                                SmallChange="10"
+                                LargeChange="25"
+                                ToolTip="Größe des vergrößerten Mauszeigers anpassen (50 % bis 300 %)"
+                                ValueChanged="MouseSizeSlider_ValueChanged"/>
+                        <CheckBox x:Name="InvertCursorCheckBox"
+                                  Content="Maus invertiert (Schwarz / weißer Rand)"
+                                  IsChecked="False"
+                                  Foreground="#FFE2E8F0"
+                                  FontWeight="Normal"
+                                  FontSize="12"
+                                  Margin="0,8,0,0"
+                                  ToolTip="Zeigt den vergrößerten Mauszeiger invertiert mit hohem Kontrast"
+                                  Checked="InvertCursor_Changed"
+                                  Unchecked="InvertCursor_Changed"/>
+                        <CheckBox x:Name="CursorFocusCheckBox"
+                                  Content="Cursor-Fokus (Word, Excel &amp; Eingabefelder)"
+                                  IsChecked="True"
+                                  Foreground="#FFE2E8F0"
+                                  FontWeight="Normal"
+                                  FontSize="12"
+                                  Margin="0,6,0,0"
+                                  ToolTip="Fokussiert die Lupe direkt auf aktive Eingabefelder, den Word-Textcursor und aktive Excel-Zellen"
+                                  Checked="CursorFocus_Changed"
+                                  Unchecked="CursorFocus_Changed"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <!-- Dialog-Buttons -->
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="8"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Button Grid.Column="0"
+                            Content="Minimieren"
+                            Height="30"
+                            Background="#FF252A36"
+                            Foreground="#FFF5F7FA"
+                            BorderBrush="#FF3B4254"
+                            Click="Minimize_Click"/>
+                    <Button Grid.Column="2"
+                            Content="Beenden"
+                            MinWidth="110"
+                            Height="30"
+                            FontWeight="SemiBold"
+                            Background="#FFB91C1C"
+                            Foreground="#FFFFFFFF"
+                            BorderBrush="#FFDC2626"
+                            Click="Exit_Click"/>
+                </Grid>
+            </StackPanel>
+        </StackPanel>
+    </Grid>
+    </ScrollViewer>
+</Window>
