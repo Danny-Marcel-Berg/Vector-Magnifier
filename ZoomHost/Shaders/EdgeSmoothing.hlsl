@@ -1,19 +1,18 @@
-// Edge-preserving, wave-free vector-style text magnifier (optimised for 120Hz+ SDR & HDR).
+// Edge-preserving, wave-free vector-style text magnifier (optimised for AMD RDNA 2 / 120Hz+ SDR & HDR).
 //
+// Pass 0a (PrepColorPS, visible crop + 16px margin):
+//   - Converts HDR scRGB (R16G16B16A16_Float) or SDR to perceptual sRGB + Rec.709 luma ONCE per
+//     desktop pixel into an R8G8B8A8_UNorm cache texture (PercepTex), eliminating 100% of per-tap
+//     pow() calls and halving texture bandwidth across PolePS and PSMain.
+// Pass 0b (PrepMetaPS, visible crop + 13px margin):
+//   - Evaluates 4-neighbour RGB flatness, horizontal luma step, and ClearType fringe flags ONCE per
+//     desktop pixel into MetaTex (R8G8B8A8_UNorm), eliminating 196 redundant neighbour loads per
+//     pixel in PolePS.
 // Pass 1 (PolePS, desktop resolution, visible crop only):
-//   - Estimates the exact surrounding background colour from nearby flat background pixels
-//     (spatial proximity + horizontal flatness + fringe rejection) and uses it directly without
-//     shifting luminance to outlier min/max pixels, so there is zero visible colour difference
-//     between the background behind letters and the background around them.
-//   - Estimates the ink colour by averaging across opposite-hue ClearType fringes on ink stems.
-//   - Auto-detects ClearType subpixel order (RGB vs BGR vs Grayscale) using central horizontal
-//     derivatives so subpixel direction never flips on thin 1px stems.
-//   - Computes a tightly centre-weighted 3x3 Scharr structure tensor encoded as a sign-invariant
-//     double-angle tangent vector, plus 3x3 local contrast so flat icon interiors, card
-//     backgrounds, and borders never receive false halos or dark shadow bands.
+//   - Zero-spill (no VGPR scratch arrays) 7x7 pole & Scharr structure-tensor pass reading strictly
+//     from PercepTex + MetaTex in L0/L1 cache.
 // Pass 2 (PSMain, screen resolution):
-//   - Early-outs with a single hardware bilinear tap on flat regions (zero halos behind letters,
-//     icons, or frames, and big GPU speedup at 1440p/4K 120Hz).
+//   - Early-outs with a single 4-byte bilinear tap on flat regions.
 //   - Unpacks 3x horizontal ClearType subpixel resolution for achromatic ClearType text.
 //   - Uses ink-connected 2x2 diagonal triangulation for grayscale & coloured text.
 //   - Applies anisotropic tangent-aligned smoothing along diagonal & curved contours.
@@ -36,6 +35,8 @@ Texture2D    DesktopTex   : register(t0);
 Texture2D    PoleDarkTex  : register(t1);
 Texture2D    PoleLightTex : register(t2);
 Texture2D    LocalExtTex  : register(t3);
+Texture2D    PercepTex    : register(t4);
+Texture2D    MetaTex      : register(t5);
 SamplerState LinearSamp   : register(s1);
 
 struct VSOut
@@ -83,13 +84,11 @@ static const float MaxBoldShift    = 0.12f;
 // Windows DWM renders SDR windows into the HDR desktop as SrgbToLinear(s) * SdrWhiteScale.
 // Converting back via LinearToSrgb(c / SdrWhiteScale) into a B8G8R8A8_UNorm sRGB swapchain lets DWM
 // display zoomed content with 100% identical gamma, brightness, black/white levels, and colours.
-// Wide-gamut negative scRGB channels and HDR highlights above SdrWhiteScale are mapped preserving
-// perceptual hue and saturation instead of clipping per-channel toward chalky white/pastel.
 float3 ToPerceptual(float3 c)
 {
     if (IsHdr < 0.5f)
     {
-        return c;
+        return saturate(c);
     }
     float3 scaled = c / max(SdrWhiteScale, 0.25f);
     float  mn     = min(0.0f, min(scaled.r, min(scaled.g, scaled.b)));
@@ -100,7 +99,7 @@ float3 ToPerceptual(float3 c)
     float3 lin    = saturate(scaled / peak);
     float3 lo     = lin * 12.92f;
     float3 hi     = 1.055f * pow(max(lin, 1e-6f), 1.0f / 2.4f) - 0.055f;
-    return (lin <= 0.0031308f) ? lo : hi;
+    return saturate((lin <= 0.0031308f) ? lo : hi);
 }
 
 float3 ToOutput(float3 s)
@@ -109,10 +108,16 @@ float3 ToOutput(float3 s)
     return (InvertColors > 0.5f) ? (1.0f - clamped) : clamped;
 }
 
-float3 FetchTexel(int2 t)
+float4 FetchPercep(int2 t)
 {
     int2 maxT = int2(DesktopSize) - 1;
-    return ToPerceptual(DesktopTex.Load(int3(clamp(t, int2(0, 0), maxT), 0)).rgb);
+    return PercepTex.Load(int3(clamp(t, int2(0, 0), maxT), 0));
+}
+
+float4 FetchMeta(int2 t)
+{
+    int2 maxT = int2(DesktopSize) - 1;
+    return MetaTex.Load(int3(clamp(t, int2(0, 0), maxT), 0));
 }
 
 float4 CatmullRom(float t)
@@ -134,6 +139,56 @@ float3 MakePole(float3 avg, float targetL, float neutralize)
     return max(targetL + chroma * keep, 0.0f);
 }
 
+// Pass 0a: Convert raw desktop texel to perceptual sRGB + Rec.709 luma ONCE per pixel.
+float4 PrepColorPS(VSOut input) : SV_TARGET
+{
+    int2   pos = int2(input.Pos.xy);
+    int2   maxT = int2(DesktopSize) - 1;
+    float3 c   = ToPerceptual(DesktopTex.Load(int3(clamp(pos, int2(0, 0), maxT), 0)).rgb);
+    float  l   = dot(c, LumaWeights);
+    return float4(c, l);
+}
+
+// Pass 0b: Precompute 4-neighbour RGB flatness, horizontal luma step, and ClearType fringe flags
+// ONCE per pixel so PolePS never re-fetches 4 neighbours inside its 7x7 loop.
+float4 PrepMetaPS(VSOut input) : SV_TARGET
+{
+    int2   pos = int2(input.Pos.xy);
+    float4 c4  = FetchPercep(pos);
+    float4 cL4 = FetchPercep(pos + int2(-1,  0));
+    float4 cR4 = FetchPercep(pos + int2( 1,  0));
+    float4 cU4 = FetchPercep(pos + int2( 0, -1));
+    float4 cD4 = FetchPercep(pos + int2( 0,  1));
+
+    float3 c  = c4.rgb;
+    float3 cL = cL4.rgb;
+    float3 cR = cR4.rgb;
+    float3 cU = cU4.rgb;
+    float3 cD = cD4.rgb;
+
+    float3 aL = abs(c - cL); float dL = max(aL.r, max(aL.g, aL.b));
+    float3 aR = abs(c - cR); float dR = max(aR.r, max(aR.g, aR.b));
+    float3 aU = abs(c - cU); float dU = max(aU.r, max(aU.g, aU.b));
+    float3 aD = abs(c - cD); float dD = max(aD.r, max(aD.g, aD.b));
+    float  dMax = max(max(dL, dR), max(dU, dD));
+    float  sameCount = (dL < 0.022f ? 1.0f : 0.0f) + (dR < 0.022f ? 1.0f : 0.0f)
+                     + (dU < 0.022f ? 1.0f : 0.0f) + (dD < 0.022f ? 1.0f : 0.0f);
+
+    float lStepH = abs(cR4.a - cL4.a);
+    float rb     = c.r - c.b;
+    float rbLs   = cL.r - cL.b;
+    float rbRs   = cR.r - cR.b;
+    float rbL    = abs(rbLs);
+    float rbR    = abs(rbRs);
+
+    float fMonoG = ((c.g >= min(c.r, c.b) - 0.04f) && (c.g <= max(c.r, c.b) + 0.04f)) ? 1.0f : 0.0f;
+    float fSand  = (rbL < 0.05f && rbR < 0.05f) ? 2.0f : 0.0f;
+    float fEdge  = (rbL < abs(rb) * 0.55f || rbR < abs(rb) * 0.55f) ? 4.0f : 0.0f;
+    float fHueH  = (abs(rb - rbLs) < 0.14f && abs(rb - rbRs) < 0.14f) ? 8.0f : 0.0f;
+
+    return float4(saturate(dMax), sameCount * 0.25f, saturate(lStepH), (fMonoG + fSand + fEdge + fHueH) / 15.0f);
+}
+
 struct PoleOut
 {
     float4 Dark     : SV_TARGET0;   // rgb: dark pole colour, a: two-tone confidence
@@ -145,23 +200,23 @@ PoleOut PolePS(VSOut input)
 {
     int2 center = int2(input.Pos.xy);
 
-    // Pass A: 7x7 extremes + 3x3 local contrast + 7x7 luma grid + darkest/lightest core pixel.
+    // Pass A: 7x7 extremes + 3x3 local contrast directly from L0/L1-cached PercepTex (zero scratch arrays!).
     float lMin = 1e6f, lMax = -1e6f, mMin = 1e6f, mMax = -1e6f;
     float chanMin = 1e6f, chanMax = -1e6f;
     float3 cDarkest = 1.0f, cLightest = 0.0f;
     float l3Min = 1e6f, l3Max = -1e6f;
     float3 c3Min = 1e6f, c3Max = -1e6f;
-    float gridL[49];
+
     [loop]
     for (int y = -PoleRadius; y <= PoleRadius; ++y)
     {
         [loop]
         for (int x = -PoleRadius; x <= PoleRadius; ++x)
         {
-            float3 c = FetchTexel(center + int2(x, y));
-            float  l = dot(c, LumaWeights);
-            float  m = dot(c, MeanWeights);
-            gridL[(y + PoleRadius) * 7 + (x + PoleRadius)] = l;
+            float4 ca = FetchPercep(center + int2(x, y));
+            float3 c  = ca.rgb;
+            float  l  = ca.a;
+            float  m  = dot(c, MeanWeights);
             if (l < lMin) { lMin = l; cDarkest  = c; }
             if (l > lMax) { lMax = l; cLightest = c; }
             mMin = min(mMin, m);  mMax = max(mMax, m);
@@ -184,7 +239,7 @@ PoleOut PolePS(VSOut input)
     // far shadow/ringing (< 18%), preventing outer halo/shadow skirts from flipping pole polarity.
     if (wideC < 0.015f || (wideC < 0.18f && localC < 0.025f))
     {
-        float3 cCenter = FetchTexel(center);
+        float3 cCenter = FetchPercep(center).rgb;
         PoleOut flatOut;
         flatOut.Dark     = float4(cCenter, 0.0f);
         flatOut.Light    = float4(cCenter, 0.5f);
@@ -195,10 +250,6 @@ PoleOut PolePS(VSOut input)
     float invL = 1.0f / max(wideC, 1e-3f);
     float invM = 1.0f / max(mMax - mMin, 1e-3f);
 
-    // Closest exact 2D-RGB-flat background anchors (dark side & light side) plus total flat weights.
-    // Using full 3-channel RGB 4-neighbour equality rejects ClearType fringes AND 1px Office dark halos
-    // while accepting EVERY coloured background (blue/green/yellow/red/beige buttons & selections)
-    // with 0.00 RGB difference from the surrounding background!
     float3 bestDarkAnchor     = 0.0f;
     float  bestDarkScore      = -1.0f;
     float3 bestLightAnchor    = 0.0f;
@@ -220,51 +271,33 @@ PoleOut PolePS(VSOut input)
     bool   winHasNegRb        = false;
     float  edgeMonoCount      = 0.0f;
 
-    float gridU[25];
-    float gridRb[25];
-
+    // Pass B: Single PercepTex + MetaTex fetch per pixel (no 4-neighbour re-fetches, no scratch arrays!).
     [loop]
     for (int y2 = -PoleRadius; y2 <= PoleRadius; ++y2)
     {
         float prevRb  = 0.0f;
         float prev2Rb = 0.0f;
-        float prevL   = 0.0f;
         [loop]
         for (int x2 = -PoleRadius; x2 <= PoleRadius; ++x2)
         {
-            int2   pos = center + int2(x2, y2);
-            float3 c   = FetchTexel(pos);
-            int    gx  = x2 + PoleRadius;
-            int    gy  = y2 + PoleRadius;
-            float  l   = gridL[gy * 7 + gx];
-            float  m   = dot(c, MeanWeights);
-            float  u   = (l - lMin) * invL;
-            float  um  = (m - mMin) * invM;
-            float  rb  = c.r - c.b;
+            int2   pos  = center + int2(x2, y2);
+            float4 ca   = FetchPercep(pos);
+            float4 meta = FetchMeta(pos);
+            float3 c    = ca.rgb;
+            float  l    = ca.a;
+            float  m    = dot(c, MeanWeights);
+            float  u    = (l - lMin) * invL;
+            float  um   = (m - mMin) * invM;
+            float  rb   = c.r - c.b;
 
-            if (abs(x2) <= 2 && abs(y2) <= 2)
-            {
-                int idx = (y2 + 2) * 5 + (x2 + 2);
-                gridU[idx]  = um;
-                gridRb[idx] = rb;
-            }
-
-            // Full 3-channel RGB 4-neighbour flatness (hits L1 texture cache on RDNA 2):
-            //   - A ClearType fringe differs in R/B from its left/right neighbour -> rejected!
-            //   - A 1px Word dark halo touches white text -> dMaxL >= 0.45 -> rejected!
-            //   - A solid coloured OR neutral background (hover button, blue button, yellow highlight,
-            //     white page) has >= 3 matching RGB neighbours -> exact match!
-            float3 cL = FetchTexel(pos + int2(-1,  0));
-            float3 cR = FetchTexel(pos + int2( 1,  0));
-            float3 cU = FetchTexel(pos + int2( 0, -1));
-            float3 cD = FetchTexel(pos + int2( 0,  1));
-            float3 aL = abs(c - cL); float dL = max(aL.r, max(aL.g, aL.b));
-            float3 aR = abs(c - cR); float dR = max(aR.r, max(aR.g, aR.b));
-            float3 aU = abs(c - cU); float dU = max(aU.r, max(aU.g, aU.b));
-            float3 aD = abs(c - cD); float dD = max(aD.r, max(aD.g, aD.b));
-            float  dMax = max(max(dL, dR), max(dU, dD));
-            float  sameCount = (dL < 0.022f ? 1.0f : 0.0f) + (dR < 0.022f ? 1.0f : 0.0f)
-                             + (dU < 0.022f ? 1.0f : 0.0f) + (dD < 0.022f ? 1.0f : 0.0f);
+            float dMax      = meta.r;
+            float sameCount = meta.g * 4.0f;
+            float lStepH    = meta.b;
+            uint  flags     = (uint)(meta.a * 15.0f + 0.5f);
+            bool  monoG     = (flags & 1u) != 0u;
+            bool  sandNbrs  = (flags & 2u) != 0u;
+            bool  edgeNbrs  = (flags & 4u) != 0u;
+            bool  sameHueH  = (flags & 8u) != 0u;
 
             float notTouchingInk = 1.0f - smoothstep(0.16f * wideC, 0.34f * wideC, dMax);
             float flat2D         = smoothstep(2.4f, 3.6f, sameCount) * notTouchingInk;
@@ -274,10 +307,6 @@ PoleOut PolePS(VSOut input)
 
             if (bgW > 0.005f)
             {
-                // Strict 3-tier background hierarchy so exact surrounding background ALWAYS wins:
-                //   Tier 1: 4-neighbour-flat (dMax < 0.022) inside 7x7 -> closest wins (score 2.4..24.0)
-                //   Tier 2: 4-neighbour-flat outside 7x7 via FarOffsets (score 0.69..1.20)
-                //   Tier 3: 3-neighbour-flat fallback inside 7x7 (score <= 0.50)
                 bool pureFlat4 = (sameCount >= 3.5f && dMax < 0.022f);
                 float anchorScore = pureFlat4 ? (24.0f / (1.0f + 0.5f * distSq)) : (0.35f * bgW);
                 if (u < 0.48f)
@@ -309,26 +338,10 @@ PoleOut PolePS(VSOut input)
 
             lightShare += (u > 0.5f) ? 1.0f : 0.0f;
 
-            // Detect ClearType fringes on thin 1px stems (pair1/pair2), medium 2-5px stems & curves
-            // (window-wide opposite-sign winHasPosRb && winHasNegRb), AND wide 6px+ neutral headings
-            // (sandwichFringe: 1px monotonic fringe strictly between two neutral pixels across a luma step).
-            // Never triggers on solid coloured icons (blue circle, orange square) or 1px coloured lines!
             float gm = c.g - 0.5f * (c.r + c.b);
-            bool monoG = (c.g >= min(c.r, c.b) - 0.04f) && (c.g <= max(c.r, c.b) + 0.04f);
-            float lStepH = abs(dot(cR, LumaWeights) - dot(cL, LumaWeights));
-            float rbL = abs(cL.r - cL.b);
-            float rbR = abs(cR.r - cR.b);
-            bool sandwichFringe = monoG && (abs(rb) > FringeChroma) &&
-                                  (rbL < 0.05f && rbR < 0.05f) &&
-                                  (lStepH > 0.25f * wideC);
-            bool edgeMonoFringe = monoG && (abs(rb) > FringeChroma) &&
-                                  (rbL < abs(rb) * 0.55f || rbR < abs(rb) * 0.55f) &&
-                                  (lStepH > 0.12f * wideC);
+            bool sandwichFringe = monoG && (abs(rb) > FringeChroma) && sandNbrs && (lStepH > 0.25f * wideC);
+            bool edgeMonoFringe = monoG && (abs(rb) > FringeChroma) && edgeNbrs && (lStepH > 0.12f * wideC);
 
-            // Detect true flat stroke-interior ink colour on 3px+ bold/large letters (sameCount >= 2,
-            // same horizontal R-B hue as BOTH cL and cR so 1-2px vertical ClearType fringe columns can
-            // NEVER be selected, and not touching the steep outer background edge).
-            bool sameHueH = (abs(rb - (cL.r - cL.b)) < 0.14f) && (abs(rb - (cR.r - cR.b)) < 0.14f);
             if (sameCount >= 1.5f && dMax < 0.18f * wideC && sameHueH && !edgeMonoFringe && !sandwichFringe)
             {
                 float inkScore = (sameCount >= 3.5f ? 3.0f : (sameCount >= 2.5f ? 1.8f : 1.0f)) / (1.0f + 1.5f * distSq);
@@ -364,7 +377,6 @@ PoleOut PolePS(VSOut input)
             }
             prev2Rb = prevRb;
             prevRb  = rb;
-            prevL   = l;
         }
     }
     if (winHasPosRb && winHasNegRb && edgeMonoCount > 0.0f)
@@ -374,27 +386,35 @@ PoleOut PolePS(VSOut input)
     }
 
     // Tightly centre-weighted 3x3 Scharr structure tensor + central-difference ClearType order vote.
+    // Reading directly from L0-cached PercepTex avoids 50-float VGPR scratch array spills on RDNA 2.
     float Jxx = 0.0f, Jxy = 0.0f, Jyy = 0.0f;
     float subpixelVote = 0.0f;
-    [unroll]
+    [loop]
     for (int gy = -1; gy <= 1; ++gy)
     {
-        [unroll]
+        [loop]
         for (int gx = -1; gx <= 1; ++gx)
         {
-            int cx = gx + 2;
-            int cy = gy + 2;
-            float dx = (3.0f * gridU[(cy - 1) * 5 + (cx + 1)] + 10.0f * gridU[cy * 5 + (cx + 1)] + 3.0f * gridU[(cy + 1) * 5 + (cx + 1)])
-                     - (3.0f * gridU[(cy - 1) * 5 + (cx - 1)] + 10.0f * gridU[cy * 5 + (cx - 1)] + 3.0f * gridU[(cy + 1) * 5 + (cx - 1)]);
-            float dy = (3.0f * gridU[(cy + 1) * 5 + (cx - 1)] + 10.0f * gridU[(cy + 1) * 5 + cx] + 3.0f * gridU[(cy + 1) * 5 + (cx + 1)])
-                     - (3.0f * gridU[(cy - 1) * 5 + (cx - 1)] + 10.0f * gridU[(cy - 1) * 5 + cx] + 3.0f * gridU[(cy - 1) * 5 + (cx + 1)]);
-            float w = (gx == 0 && gy == 0) ? 4.0f : ((gx == 0 || gy == 0) ? 1.5f : 0.5f);
+            int2 p = center + int2(gx, gy);
+            float uTL = (dot(FetchPercep(p + int2(-1, -1)).rgb, MeanWeights) - mMin) * invM;
+            float uTC = (dot(FetchPercep(p + int2( 0, -1)).rgb, MeanWeights) - mMin) * invM;
+            float uTR = (dot(FetchPercep(p + int2( 1, -1)).rgb, MeanWeights) - mMin) * invM;
+            float uML = (dot(FetchPercep(p + int2(-1,  0)).rgb, MeanWeights) - mMin) * invM;
+            float3 cMC = FetchPercep(p).rgb;
+            float uMR = (dot(FetchPercep(p + int2( 1,  0)).rgb, MeanWeights) - mMin) * invM;
+            float uBL = (dot(FetchPercep(p + int2(-1,  1)).rgb, MeanWeights) - mMin) * invM;
+            float uBC = (dot(FetchPercep(p + int2( 0,  1)).rgb, MeanWeights) - mMin) * invM;
+            float uBR = (dot(FetchPercep(p + int2( 1,  1)).rgb, MeanWeights) - mMin) * invM;
+
+            float dx = (3.0f * uTR + 10.0f * uMR + 3.0f * uBR) - (3.0f * uTL + 10.0f * uML + 3.0f * uBL);
+            float dy = (3.0f * uBL + 10.0f * uBC + 3.0f * uBR) - (3.0f * uTL + 10.0f * uTC + 3.0f * uTR);
+            float w  = (gx == 0 && gy == 0) ? 4.0f : ((gx == 0 || gy == 0) ? 1.5f : 0.5f);
             Jxx += w * dx * dx;
             Jxy += w * dx * dy;
             Jyy += w * dy * dy;
 
-            float dmCenter = gridU[cy * 5 + (cx + 1)] - gridU[cy * 5 + (cx - 1)];
-            float rbHere   = gridRb[cy * 5 + cx];
+            float dmCenter = uMR - uML;
+            float rbHere   = cMC.r - cMC.b;
             if (abs(dmCenter) > 0.10f && abs(rbHere) > FringeChroma)
             {
                 subpixelVote += clamp(rbHere * dmCenter * 16.0f, -1.0f, 1.0f);
@@ -412,10 +432,7 @@ PoleOut PolePS(VSOut input)
     float  neutralize  = smoothstep(FringeNeutralLo, FringeNeutralHi, fringePairs / window);
     float  lightFrac   = lightShare / window;
 
-    // Whenever the 7x7 window lacked a pure 4-neighbour-flat pixel on EITHER the dark or light
-    // side (e.g. inside bold strokes like "M"/"E" of "SUMME" or dense 8.5pt stems), probe nearby
-    // offsets outside the stroke so we always find the true surrounding background colour and
-    // avoid inverting ink/background polarity inside wide bold strokes.
+    // Far-offset probe: 1 MetaTex fetch per offset instead of 5 HDR fetches!
     float flatTotal  = darkFlatW + lightFlatW;
     float polDarkW   = darkFlatW;
     float polLightW  = lightFlatW;
@@ -434,31 +451,21 @@ PoleOut PolePS(VSOut input)
         [loop]
         for (int p = 0; p < 16; ++p)
         {
-            int2   pt = center + FarOffsets[p];
-            float3 cf = FetchTexel(pt);
-            float3 cL = FetchTexel(pt + int2(-1,  0));
-            float3 cR = FetchTexel(pt + int2( 1,  0));
-            float3 cU = FetchTexel(pt + int2( 0, -1));
-            float3 cD = FetchTexel(pt + int2( 0,  1));
-            float3 aL = abs(cf - cL); float dL = max(aL.r, max(aL.g, aL.b));
-            float3 aR = abs(cf - cR); float dR = max(aR.r, max(aR.g, aR.b));
-            float3 aU = abs(cf - cU); float dU = max(aU.r, max(aU.g, aU.b));
-            float3 aD = abs(cf - cD); float dD = max(aD.r, max(aD.g, aD.b));
-            float  dMaxF = max(max(dL, dR), max(dU, dD));
-            if (dMaxF < 0.022f)
+            int2 pt = center + FarOffsets[p];
+            if (FetchMeta(pt).r < 0.022f)
             {
-                float lf = dot(cf, LumaWeights);
-                float uf = (lf - lMin) * invL;
-                float fDistSq = (float)(FarOffsets[p].x * FarOffsets[p].x + FarOffsets[p].y * FarOffsets[p].y);
-                float fPolW   = 0.65f / (1.0f + 0.10f * fDistSq);
-                float fScore  = 1.80f / (1.0f + 0.02f * fDistSq);
+                float4 cf4 = FetchPercep(pt);
+                float  uf  = (cf4.a - lMin) * invL;
+                float  fDistSq = (float)(FarOffsets[p].x * FarOffsets[p].x + FarOffsets[p].y * FarOffsets[p].y);
+                float  fPolW   = 0.65f / (1.0f + 0.10f * fDistSq);
+                float  fScore  = 1.80f / (1.0f + 0.02f * fDistSq);
                 if (uf < 0.48f)
                 {
                     polDarkW += fPolW;
                     if (fScore > bestDarkScore)
                     {
                         bestDarkScore  = fScore;
-                        bestDarkAnchor = cf;
+                        bestDarkAnchor = cf4.rgb;
                     }
                 }
                 else if (uf > 0.52f)
@@ -467,25 +474,20 @@ PoleOut PolePS(VSOut input)
                     if (fScore > bestLightScore)
                     {
                         bestLightScore  = fScore;
-                        bestLightAnchor = cf;
+                        bestLightAnchor = cf4.rgb;
                     }
                 }
             }
         }
     }
 
-    // Determine ink polarity cleanly from 2D-flat background dominance (tight transition so ink pole
-    // never contaminates the exact surrounding background colour!).
     float polTotal     = polDarkW + polLightW;
     float bgLightShare = (polTotal > 0.01f) ? (polLightW / polTotal) : lightFrac;
     float darkIsInk    = smoothstep(0.47f, 0.53f, bgLightShare);
 
-    // Ink colours (broad average cancels opposite-hue ClearType fringes on stems).
     float3 darkInkAvg  = darkBroadSum  / max(darkBroadW,  1e-4f);
     float3 lightInkAvg = lightBroadSum / max(lightBroadW, 1e-4f);
 
-    // Exact surrounding background colour: directly use the closest 2D-RGB-flat anchor pixel!
-    // Guaranteed 0.00 RGB difference between the background behind text and the surrounding background.
     float3 darkBgExact  = (bestDarkScore  > 0.0f) ? bestDarkAnchor  : darkInkAvg;
     float3 lightBgExact = (bestLightScore > 0.0f) ? bestLightAnchor : lightInkAvg;
 
@@ -500,8 +502,6 @@ PoleOut PolePS(VSOut input)
     bool  hasColoredLightCore = (bestLightInkScore > 0.0f) && (length(bestLightInkAnchor - dot(bestLightInkAnchor, LumaWeights)) > 0.14f);
     if (darkIsInk > 0.5f && neutralize > 0.20f && hasOppositeFringes && !hasColoredDarkCore)
     {
-        // Only neutralize truly achromatic black/dark-gray ClearType stems — NEVER dark coloured
-        // text like dark blue ("SUMME"), dark red, dark green, or dark purple!
         float coreMax = max(cDarkest.r, max(cDarkest.g, cDarkest.b));
         bool  coreMono = (cDarkest.g >= min(cDarkest.r, cDarkest.b) - 0.05f) &&
                          (cDarkest.g <= max(cDarkest.r, cDarkest.b) + 0.05f);
@@ -522,8 +522,6 @@ PoleOut PolePS(VSOut input)
         }
     }
 
-    // Recover true pure black / pure white on thin 1px ClearType stems: at least one RGB subpixel hits
-    // the full stem core (chanMin / chanMax) even when luma lMin/lMax is lifted by subpixel filtering.
     float targetDarkL  = lerp(lMin, min(lMin, chanMin), darkIsNeutralInk);
     float targetLightL = lerp(lMax, max(lMax, chanMax), lightIsNeutralInk);
     if (darkIsInk > 0.5f && darkChroma < 0.04f && lMin < 0.08f)
@@ -542,9 +540,6 @@ PoleOut PolePS(VSOut input)
                                 max(float3(targetLightL, targetLightL, targetLightL), 0.0f),
                                 lightIsNeutralInk);
 
-    // On bold/large strokes that have a true flat interior fill, use the exact stroke interior colour
-    // (still passed through MakePole for ClearType safety) so 1px sharpening/ringing rims on stroke
-    // edges cannot create a hollow double-line inside letters!
     if (bestDarkInkScore > 0.0f)
     {
         float inkL = dot(bestDarkInkAnchor, LumaWeights);
@@ -568,32 +563,31 @@ PoleOut PolePS(VSOut input)
         }
     }
 
-    // Background pole uses the exact surrounding 2D-flat background colour; ink pole uses cleaned ink colour.
     float3 finalDark  = lerp(darkBgExact,  inkDarkColor,  darkIsInk);
     float3 finalLight = lerp(inkLightColor, lightBgExact, darkIsInk);
 
-    // Re-evaluate two-tone confidence against the TRUE (finalDark, finalLight) poles.
-    // Both outer background halos AND inner stroke-edge ringing rims outside [finalDarkL, finalLightL]
-    // clamp cleanly onto the poles (completely erasing them!) instead of dragging down twoTone.
+    // Re-evaluate two-tone confidence directly from L0-cached PercepTex.a (zero scratch arrays!).
     float finalDarkL  = dot(finalDark,  LumaWeights);
     float finalLightL = dot(finalLight, LumaWeights);
     float invFinalC   = 1.0f / max(finalLightL - finalDarkL, 1e-3f);
     float nearPole    = 0.0f;
     float exactPole   = 0.0f;
-    [unroll]
-    for (int k = 0; k < 49; ++k)
+    [loop]
+    for (int ky = -PoleRadius; ky <= PoleRadius; ++ky)
     {
-        float lk = gridL[k];
-        float uk = saturate((lk - finalDarkL) * invFinalC);
-        nearPole += (uk < 0.25f || uk > 0.75f) ? 1.0f : 0.0f;
-        bool onDark  = (lk <= finalDarkL  + ExactPoleTol);
-        bool onLight = (lk >= finalLightL - ExactPoleTol);
-        exactPole += (onDark || onLight) ? 1.0f : 0.0f;
+        [loop]
+        for (int kx = -PoleRadius; kx <= PoleRadius; ++kx)
+        {
+            float lk = FetchPercep(center + int2(kx, ky)).a;
+            float uk = saturate((lk - finalDarkL) * invFinalC);
+            nearPole += (uk < 0.25f || uk > 0.75f) ? 1.0f : 0.0f;
+            bool onDark  = (lk <= finalDarkL  + ExactPoleTol);
+            bool onLight = (lk >= finalLightL - ExactPoleTol);
+            exactPole += (onDark || onLight) ? 1.0f : 0.0f;
+        }
     }
 
     float score      = (nearPole + exactPole + FringeBonus * fringePairs) / window;
-    // Require clear consistent ClearType subpixel vote AND neutral ink so colourful multi-tone
-    // icons (e.g. yellow+blue paintbrush) never falsely trigger horizontal ClearType unpacking!
     float isNeutralPole = max(darkIsNeutralInk, lightIsNeutralInk);
     float ctStrength = saturate(abs(subpixelVote) * 0.6f) * neutralize * isNeutralPole;
     float ctDir      = (subpixelVote < -0.35f) ? 1.0f : (subpixelVote > 0.35f ? -1.0f : 0.0f);
@@ -613,10 +607,10 @@ float SampleGrayConnected(float2 pos, float lWideLo, float invWideC, float darkI
     int2   i0 = int2(floor(p));
     float2 f  = p - floor(p);
 
-    float ua = saturate((dot(FetchTexel(i0 + int2(0, 0)), LumaWeights) - lWideLo) * invWideC);
-    float ub = saturate((dot(FetchTexel(i0 + int2(1, 0)), LumaWeights) - lWideLo) * invWideC);
-    float uc = saturate((dot(FetchTexel(i0 + int2(0, 1)), LumaWeights) - lWideLo) * invWideC);
-    float ud = saturate((dot(FetchTexel(i0 + int2(1, 1)), LumaWeights) - lWideLo) * invWideC);
+    float ua = saturate((FetchPercep(i0 + int2(0, 0)).a - lWideLo) * invWideC);
+    float ub = saturate((FetchPercep(i0 + int2(1, 0)).a - lWideLo) * invWideC);
+    float uc = saturate((FetchPercep(i0 + int2(0, 1)).a - lWideLo) * invWideC);
+    float ud = saturate((FetchPercep(i0 + int2(1, 1)).a - lWideLo) * invWideC);
 
     float uBilin = lerp(lerp(ua, ub, f.x), lerp(uc, ud, f.x), f.y);
 
@@ -661,8 +655,8 @@ float SampleCoverageFast(
         float x0 = floor(pos.x - 0.5f);
         float fx = (pos.x - 0.5f) - x0;
 
-        float3 c0 = ToPerceptual(DesktopTex.SampleLevel(LinearSamp, float2(x0 + 0.5f, pos.y) * invDesktop, 0).rgb);
-        float3 c1 = ToPerceptual(DesktopTex.SampleLevel(LinearSamp, float2(x0 + 1.5f, pos.y) * invDesktop, 0).rgb);
+        float3 c0 = PercepTex.SampleLevel(LinearSamp, float2(x0 + 0.5f, pos.y) * invDesktop, 0).rgb;
+        float3 c1 = PercepTex.SampleLevel(LinearSamp, float2(x0 + 1.5f, pos.y) * invDesktop, 0).rgb;
 
         float3 u0 = saturate((c0 - wideDark) * invSpan);
         float3 u1 = saturate((c1 - wideDark) * invSpan);
@@ -700,10 +694,10 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
 
     float  localC    = localInfo.a;
     // Ultra-fast flat-pixel early-out (desktop background, icon fills, flat UI cards):
-    // 1 hardware tap, exact sRGB colour, zero outer pole-boundary box or halo!
+    // 1 hardware 4-byte tap from PercepTex, exact sRGB colour, zero HDR pow() overhead!
     if (localC < 0.008f)
     {
-        return ToOutput(ToPerceptual(DesktopTex.SampleLevel(LinearSamp, poleUv, 0).rgb));
+        return ToOutput(PercepTex.SampleLevel(LinearSamp, poleUv, 0).rgb);
     }
 
     float3 wideDark  = wideDarkA.rgb;
@@ -729,25 +723,20 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
     float2 tang      = float2(cos(theta), sin(theta));
     float  diagFactor = pow(abs(2.0f * tang.x * tang.y), 0.45f);
 
-    // Fetch local 2x2 texels once so we can verify whether the 2x2 cell truly lies on the 2-pole
-    // RGB segment [wideDark, wideLight] (multi-color icons like a blue circle + white check or an
-    // orange square + green border have a 3rd colour off the segment -> hand off cleanly to cVecIcon!).
     float2 p2    = world - 0.5f;
     float2 cell2 = floor(p2);
     float2 f2    = p2 - cell2;
     int2   i02   = int2(cell2);
-    float3 c00 = FetchTexel(i02 + int2(0, 0));
-    float3 c10 = FetchTexel(i02 + int2(1, 0));
-    float3 c01 = FetchTexel(i02 + int2(0, 1));
-    float3 c11 = FetchTexel(i02 + int2(1, 1));
+    float4 c00_4 = FetchPercep(i02 + int2(0, 0));
+    float4 c10_4 = FetchPercep(i02 + int2(1, 0));
+    float4 c01_4 = FetchPercep(i02 + int2(0, 1));
+    float4 c11_4 = FetchPercep(i02 + int2(1, 1));
+    float3 c00 = c00_4.rgb;
+    float3 c10 = c10_4.rgb;
+    float3 c01 = c01_4.rgb;
+    float3 c11 = c11_4.rgb;
 
     float onSegment = 1.0f;
-    // Only hand off to the multi-color icon path when a 2x2 pixel is genuinely a 3rd SOLID icon hue
-    // (NOT a 1px monotonic ClearType fringe inside [wideDark, wideLight], whether on neutral OR
-    // coloured syntax-highlighted text!).
-    // Measuring horizontal solidity on the OFF-SEGMENT residual (c - p) distinguishes solid coloured
-    // icons (e.g. blue circle, yellow brush) from coloured ClearType text (whose solid interior lies
-    // ON the pole segment so its residual is ~0!).
     if (abs(ctSigned) <= 0.08f)
     {
         float3 boxLo   = min(wideDark, wideLight) - 0.035f;
@@ -764,19 +753,11 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
         float3 r01 = c01 - p01;
         float3 r11 = c11 - p11;
 
-        // Two horizontally adjacent pixels BOTH strongly off-segment in the same colour direction
-        // marks a real solid 3rd-colour icon feature (e.g. blue circle, yellow brush, green border),
-        // never a ClearType fringe, dark drop shadow, or bright ringing halo!
         float lenR00 = length(r00), lenR10 = length(r10), lenR01 = length(r01), lenR11 = length(r11);
         bool allowSolidBox = (minChanC > 0.55f * maxChanC);
         bool solidOffSegH = (dot(r00, r10) > 0.05f && min(lenR00, lenR10) > 0.22f)
                          || (dot(r01, r11) > 0.05f && min(lenR01, lenR11) > 0.22f);
 
-        // Inside [boxLo, boxHi], ANY non-solid texel is anti-aliased / ClearType ink+background (even
-        // on strongly coloured backgrounds like black-on-yellow where green lags behind red/blue).
-        // Outside [boxLo, boxHi], a non-solid neutral OR monotonic ClearType fringe (e.g. ClearType over
-        // an outer bright halo or dark drop shadow) is NEVER a 3rd multi-color icon hue -> keep on
-        // the 2-pole path to erase it cleanly!
         bool inBox00 = all(c00 >= boxLo) && all(c00 <= boxHi);
         bool inBox10 = all(c10 >= boxLo) && all(c10 <= boxHi);
         bool inBox01 = all(c01 >= boxLo) && all(c01 <= boxHi);
@@ -804,8 +785,6 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
         onSegment = 1.0f - smoothstep(0.08f, 0.18f, maxSegErr);
     }
 
-    // Keep edgeMask = 1.0 across the ENTIRE outer & inner halo/shadow skirts of 2-tone text/lines
-    // (no ghost shadows/halos leaking from smoothRgb), while cleanly handing off 3+ colour icons.
     float edgeMask = twoTone
                    * onSegment
                    * smoothstep(EdgeContrastLo, EdgeContrastHi, wideC);
@@ -813,12 +792,9 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
     float3 smoothRgb = 0.0f;
     if (edgeMask < 0.999f)
     {
-        // Multi-color icon / border / line vector path:
-        // Reconstruct sharp tangent-aligned vector contours strictly inside the local 2x2 colour endpoints.
         float3 inLo = min(min(c00, c10), min(c01, c11));
         float3 inHi = max(max(c00, c10), max(c01, c11));
 
-        // Base clamped Catmull-Rom (zero ringing)
         int2   base = i02 - 1;
         float4 wx = CatmullRom(f2.x);
         float4 wy = CatmullRom(f2.y);
@@ -829,18 +805,16 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
             [unroll]
             for (int x = 0; x < 4; ++x)
             {
-                float3 c = FetchTexel(base + int2(x, y));
+                float3 c = FetchPercep(base + int2(x, y)).rgb;
                 cSum += c * (wx[x] * wy[y]);
             }
         }
         smoothRgb = clamp(cSum, inLo, inHi);
 
-        // Local 2x2 endpoints: pick the pair with largest RGB distance so even isoluminant coloured
-        // icon edges (e.g. blue vs green or red vs gray) get crisp vector edges!
-        float l00 = dot(c00, LumaWeights);
-        float l10 = dot(c10, LumaWeights);
-        float l01 = dot(c01, LumaWeights);
-        float l11 = dot(c11, LumaWeights);
+        float l00 = c00_4.a;
+        float l10 = c10_4.a;
+        float l01 = c01_4.a;
+        float l11 = c11_4.a;
         float lLo = l00; float3 cLo = c00;
         if (l10 < lLo) { lLo = l10; cLo = c10; }
         if (l01 < lLo) { lLo = l01; cLo = c01; }
@@ -856,28 +830,26 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
         if (coherence > 0.25f && c2Len > 0.04f)
         {
             float iconSpan = coherence * lerp(0.0f, 0.80f, diagFactor);
-            float3 cT1 = ToPerceptual(DesktopTex.SampleLevel(LinearSamp, world * invDesktop, 0).rgb);
+            float3 cT1 = PercepTex.SampleLevel(LinearSamp, world * invDesktop, 0).rgb;
             float3 cTang = cT1;
             if (iconSpan > 0.04f)
             {
-                float3 cT0 = ToPerceptual(DesktopTex.SampleLevel(LinearSamp, (world - tang * iconSpan) * invDesktop, 0).rgb);
-                float3 cT2 = ToPerceptual(DesktopTex.SampleLevel(LinearSamp, (world + tang * iconSpan) * invDesktop, 0).rgb);
+                float3 cT0 = PercepTex.SampleLevel(LinearSamp, (world - tang * iconSpan) * invDesktop, 0).rgb;
+                float3 cT2 = PercepTex.SampleLevel(LinearSamp, (world + tang * iconSpan) * invDesktop, 0).rgb;
                 cTang = clamp(0.25f * (cT0 + cT2) + 0.50f * cT1, inLo, inHi);
             }
 
             float3 axis   = c2Diff / max(c2Len, 1e-4f);
             float  uIcon  = saturate(dot(cTang - cLo, axis) / max(c2Len, 1e-3f));
             float2 norm   = float2(-tang.y, tang.x);
-            float3 cPos   = ToPerceptual(DesktopTex.SampleLevel(LinearSamp, (world + norm * 0.35f) * invDesktop, 0).rgb);
-            float3 cNeg   = ToPerceptual(DesktopTex.SampleLevel(LinearSamp, (world - norm * 0.35f) * invDesktop, 0).rgb);
+            float3 cPos   = PercepTex.SampleLevel(LinearSamp, (world + norm * 0.35f) * invDesktop, 0).rgb;
+            float3 cNeg   = PercepTex.SampleLevel(LinearSamp, (world - norm * 0.35f) * invDesktop, 0).rgb;
             float  gradIcon = abs(dot(cPos - cNeg, axis)) / (0.70f * max(c2Len, 1e-3f));
             float  aaIcon = max(gradIcon / Zoom, 1e-4f) * lerp(0.62f, 0.78f, saturate(Sharpness));
             float  tIcon  = saturate((uIcon - 0.5f) / aaIcon + 0.5f);
 
             float3 cVecIcon = lerp(cLo, cHi, tIcon);
             float  colErr   = length(cTang - lerp(cLo, cHi, uIcon));
-            // Sharpen real multi-color icon boundaries (including chromatic ones!) while refusing to
-            // sharpen tiny outer/inner AA skirts of a nearby high-contrast 2-tone edge.
             float  c2RgbMax = max(abs(c2Diff.r), max(abs(c2Diff.g), abs(c2Diff.b)));
             float  realEdge = max(
                 smoothstep(0.35f, 0.65f, c2Span / max(wideC, 1e-3f)),
@@ -898,9 +870,6 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
     float darkInk = smoothstep(0.47f, 0.53f, wideLightA.a);
     float inkSign = darkInk * 2.0f - 1.0f;
 
-    // Only apply tangent smoothing on actual diagonals/curves (0 on vertical/horizontal stems so
-    // stem tips never form teardrop blobs), and guard narrow inter-letter BACKGROUND gaps so
-    // letters NEVER merge while thin diagonal lines & circles stay 100% continuous!
     float smoothScale = lerp(0.70f, 1.0f, saturate(Sharpness));
     float maxSpan = ((useSubpixel > 0.5f) ? 0.90f : 1.15f) * smoothScale;
     float span    = coherence * lerp(0.0f, maxSpan, diagFactor);
@@ -915,9 +884,6 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
         float uP2 = SampleCoverageFast(world + tang * span,          invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
         float uSmooth = 0.14f * (uM2 + uP2) + 0.22f * (uM1 + uP1) + 0.28f * uCenter;
 
-        // Guard ONLY background gaps between strokes (never stroke interiors, so 1px diagonal lines stay solid!):
-        // Dark ink: gap is a bright ridge (uCenter > 0.42 and higher than both tangent neighbours).
-        // Light ink: gap is a dark valley (uCenter < 0.58 and lower than both tangent neighbours).
         float bgGap = (darkInk > 0.5f)
             ? ((uCenter > 0.42f) ? max(0.0f, uCenter - max(uM1, uP1)) : 0.0f)
             : ((uCenter < 0.58f) ? max(0.0f, min(uM1, uP1) - uCenter) : 0.0f);
@@ -934,12 +900,8 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
     float2 uGrad = float2((uNxP - uNxM) / (2.0f * epsX), (uNyP - uNyM) / (2.0f * epsY));
 
     float uPerScreenPx = length(uGrad) / Zoom;
-    // Razor-sharp vector contour AA (~0.58..0.72 screen pixels across the whole EdgeSmoothing range):
-    // crisp print-like text edges while keeping curves and diagonals smooth and stairstep-free.
     float aa = max(uPerScreenPx, 1e-4f) * lerp(0.58f, 0.72f, saturate(Sharpness));
 
-    // Subtle +0.04 compensation ONLY on ClearType white-on-dark text so dark-mode letters stay
-    // crisp and separated without thinning 1px white lines or circles.
     float baseThresh = 0.50f + 0.04f * (1.0f - darkInk) * useSubpixel;
     float threshold  = baseThresh + inkSign * MaxBoldShift * saturate(TextGamma);
     float t = saturate((u - threshold) / aa + 0.5f);

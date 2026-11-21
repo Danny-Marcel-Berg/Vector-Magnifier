@@ -67,7 +67,7 @@ public sealed class EdgeSmoothingShader : IDisposable
         public float StrokeR, StrokeG, StrokeB, StrokeA;
     }
 
-    private readonly record struct ShaderBytecode(byte[] Vs, byte[] VsCrop, byte[] PsPole, byte[] Ps, byte[] VsCursor, byte[] PsCursor);
+    private readonly record struct ShaderBytecode(byte[] Vs, byte[] VsCrop, byte[] PsPrepColor, byte[] PsPrepMeta, byte[] PsPole, byte[] Ps, byte[] VsCursor, byte[] PsCursor);
 
     private readonly record struct RenderTarget(ID3D11Texture2D Texture, ID3D11RenderTargetView Rtv, ID3D11ShaderResourceView Srv) : IDisposable
     {
@@ -83,6 +83,8 @@ public sealed class EdgeSmoothingShader : IDisposable
     private readonly ID3D11DeviceContext _context;
     private readonly ID3D11VertexShader _vs;
     private readonly ID3D11VertexShader _vsCrop;
+    private readonly ID3D11PixelShader _psPrepColor;
+    private readonly ID3D11PixelShader _psPrepMeta;
     private readonly ID3D11PixelShader _psPole;
     private readonly ID3D11PixelShader _ps;
     private readonly ID3D11VertexShader _vsCursor;
@@ -97,7 +99,9 @@ public sealed class EdgeSmoothingShader : IDisposable
     private ID3D11Texture2D? _trackedTexture;
     private ID3D11ShaderResourceView? _desktopSrv;
 
-    // Pole pass outputs (t1..t3 in the magnify pass).
+    // Pre-pass and pole pass outputs (t1..t5 in PolePS / PSMain).
+    private RenderTarget? _percepTex;
+    private RenderTarget? _metaTex;
     private RenderTarget? _poleDark;
     private RenderTarget? _poleLight;
     private RenderTarget? _localExt;
@@ -118,6 +122,8 @@ public sealed class EdgeSmoothingShader : IDisposable
         ShaderBytecode bytecode = LoadOrCompileShaders();
         _vs = _device.CreateVertexShader(bytecode.Vs);
         _vsCrop = _device.CreateVertexShader(bytecode.VsCrop);
+        _psPrepColor = _device.CreatePixelShader(bytecode.PsPrepColor);
+        _psPrepMeta = _device.CreatePixelShader(bytecode.PsPrepMeta);
         _psPole = _device.CreatePixelShader(bytecode.PsPole);
         _ps = _device.CreatePixelShader(bytecode.Ps);
         _vsCursor = _device.CreateVertexShader(bytecode.VsCursor);
@@ -206,6 +212,7 @@ public sealed class EdgeSmoothingShader : IDisposable
             _context.PSSetShaderResource(1, _poleDark!.Value.Srv);
             _context.PSSetShaderResource(2, _poleLight!.Value.Srv);
             _context.PSSetShaderResource(3, _localExt!.Value.Srv);
+            _context.PSSetShaderResource(4, _percepTex!.Value.Srv);
         }
         _context.Draw(3, 0);
 
@@ -301,14 +308,43 @@ public sealed class EdgeSmoothingShader : IDisposable
         int x1 = Math.Clamp(reqX1 + panSlack, 0, desktopWidth);
         int y1 = Math.Clamp(reqY1 + panSlack, 0, desktopHeight);
 
+        int pcX0 = Math.Clamp(x0 - 16, 0, desktopWidth);
+        int pcY0 = Math.Clamp(y0 - 16, 0, desktopHeight);
+        int pcX1 = Math.Clamp(x1 + 16, 0, desktopWidth);
+        int pcY1 = Math.Clamp(y1 + 16, 0, desktopHeight);
+
+        int pmX0 = Math.Clamp(x0 - 13, 0, desktopWidth);
+        int pmY0 = Math.Clamp(y0 - 13, 0, desktopHeight);
+        int pmX1 = Math.Clamp(x1 + 13, 0, desktopWidth);
+        int pmY1 = Math.Clamp(y1 + 13, 0, desktopHeight);
+
         UnbindShaderResources();
-        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, x0, y0, x1, y1);
         _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
         _context.RSSetViewport(0, 0, desktopWidth, desktopHeight);
-        _context.OMSetRenderTargets([_poleDark!.Value.Rtv, _poleLight!.Value.Rtv, _localExt!.Value.Rtv]);
         _context.VSSetShader(_vsCrop);
-        _context.PSSetShader(_psPole);
+
+        // Pass 0a: Convert raw desktop (HDR/SDR) -> perceptual sRGB + luma once per pixel.
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, pcX0, pcY0, pcX1, pcY1);
+        _context.OMSetRenderTargets(_percepTex!.Value.Rtv);
+        _context.PSSetShader(_psPrepColor);
         _context.PSSetShaderResource(0, _desktopSrv!);
+        _context.Draw(4, 0);
+        _context.OMSetRenderTargets((ID3D11RenderTargetView)null!);
+
+        // Pass 0b: Precompute 4-neighbour RGB flatness + ClearType fringe flags once per pixel.
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, pmX0, pmY0, pmX1, pmY1);
+        _context.OMSetRenderTargets(_metaTex!.Value.Rtv);
+        _context.PSSetShader(_psPrepMeta);
+        _context.PSSetShaderResource(4, _percepTex!.Value.Srv);
+        _context.Draw(4, 0);
+        _context.OMSetRenderTargets((ID3D11RenderTargetView)null!);
+
+        // Pass 1: Zero-spill PolePS reading strictly from PercepTex (t4) + MetaTex (t5).
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, x0, y0, x1, y1);
+        _context.OMSetRenderTargets([_poleDark!.Value.Rtv, _poleLight!.Value.Rtv, _localExt!.Value.Rtv]);
+        _context.PSSetShader(_psPole);
+        _context.PSSetShaderResource(4, _percepTex!.Value.Srv);
+        _context.PSSetShaderResource(5, _metaTex!.Value.Srv);
         _context.Draw(4, 0);
         _context.OMSetRenderTargets([(ID3D11RenderTargetView)null!, null!, null!]);
 
@@ -324,12 +360,14 @@ public sealed class EdgeSmoothingShader : IDisposable
         _context.PSSetShaderResource(1, null!);
         _context.PSSetShaderResource(2, null!);
         _context.PSSetShaderResource(3, null!);
+        _context.PSSetShaderResource(4, null!);
+        _context.PSSetShaderResource(5, null!);
     }
 
     private void EnsurePoleTargets(int desktopWidth, int desktopHeight, bool isHdr)
     {
-        // PolePS always outputs perceptual sRGB [0, 1] (converting HDR linear scRGB via exact
-        // inverse Windows piecewise sRGB OETF), so 8-bit UNorm is exact and halves VRAM bandwidth.
+        // All intermediate targets store perceptual sRGB [0, 1] or normalised metadata in 8-bit UNorm,
+        // halving VRAM bandwidth and maximizing AMD RDNA 2 L0/L1 cache hit rates.
         _ = isHdr;
         Format format = Format.R8G8B8A8_UNorm;
         if (_poleDark is not null && _poleWidth == desktopWidth && _poleHeight == desktopHeight && _poleFormat == format)
@@ -351,13 +389,11 @@ public sealed class EdgeSmoothingShader : IDisposable
             BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource
         };
 
+        _percepTex = CreateRenderTarget(desc);
+        _metaTex = CreateRenderTarget(desc);
         _poleDark = CreateRenderTarget(desc);
         _poleLight = CreateRenderTarget(desc);
-        // LocalExt stores only normalised [0, 1] tangent/ClearType/localC data, so 8-bit UNorm
-        // is always exact and cuts pole-pass HDR VRAM bandwidth by a third.
-        Texture2DDescription localDesc = desc;
-        localDesc.Format = Format.R8G8B8A8_UNorm;
-        _localExt = CreateRenderTarget(localDesc);
+        _localExt = CreateRenderTarget(desc);
         (_poleWidth, _poleHeight, _poleFormat) = (desktopWidth, desktopHeight, format);
         _hasPoles = false;
     }
@@ -370,6 +406,8 @@ public sealed class EdgeSmoothingShader : IDisposable
 
     private void ReleasePoleTargets()
     {
+        _percepTex?.Dispose(); _percepTex = null;
+        _metaTex?.Dispose(); _metaTex = null;
         _poleDark?.Dispose(); _poleDark = null;
         _poleLight?.Dispose(); _poleLight = null;
         _localExt?.Dispose(); _localExt = null;
@@ -431,6 +469,8 @@ public sealed class EdgeSmoothingShader : IDisposable
         _vsCursor.Dispose();
         _ps.Dispose();
         _psPole.Dispose();
+        _psPrepMeta.Dispose();
+        _psPrepColor.Dispose();
         _vsCrop.Dispose();
         _vs.Dispose();
     }
@@ -443,13 +483,13 @@ public sealed class EdgeSmoothingShader : IDisposable
     private static ShaderBytecode LoadOrCompileShaders()
     {
         string source = ReadEmbeddedHlsl();
-        string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
+        string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("O3|" + source)));
         string cacheDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ZoomText_Clone",
             "ShaderCache");
 
-        string[] paths = ["vs", "vscrop", "pspole", "ps", "vscursor", "pscursor"];
+        string[] paths = ["vs", "vscrop", "psprepcolor", "psprepmeta", "pspole", "ps", "vscursor", "pscursor"];
         for (int i = 0; i < paths.Length; i++)
         {
             paths[i] = Path.Combine(cacheDir, $"{paths[i]}_{hash}.cso");
@@ -460,25 +500,29 @@ public sealed class EdgeSmoothingShader : IDisposable
             return cached;
         }
 
-        byte[] vs = [], vsCrop = [], psPole = [], ps = [], vsCursor = [], psCursor = [];
+        byte[] vs = [], vsCrop = [], psPrepColor = [], psPrepMeta = [], psPole = [], ps = [], vsCursor = [], psCursor = [];
         System.Threading.Tasks.Parallel.Invoke(
             () => vs = Compile(source, "VSMain", "vs_5_0"),
             () => vsCrop = Compile(source, "VSCropMain", "vs_5_0"),
+            () => psPrepColor = Compile(source, "PrepColorPS", "ps_5_0"),
+            () => psPrepMeta = Compile(source, "PrepMetaPS", "ps_5_0"),
             () => psPole = Compile(source, "PolePS", "ps_5_0"),
             () => ps = Compile(source, "PSMain", "ps_5_0"),
             () => vsCursor = Compile(source, "VSCursor", "vs_5_0"),
             () => psCursor = Compile(source, "PSCursor", "ps_5_0"));
-        ShaderBytecode compiled = new(vs, vsCrop, psPole, ps, vsCursor, psCursor);
+        ShaderBytecode compiled = new(vs, vsCrop, psPrepColor, psPrepMeta, psPole, ps, vsCursor, psCursor);
 
         try
         {
             Directory.CreateDirectory(cacheDir);
             File.WriteAllBytes(paths[0], compiled.Vs);
             File.WriteAllBytes(paths[1], compiled.VsCrop);
-            File.WriteAllBytes(paths[2], compiled.PsPole);
-            File.WriteAllBytes(paths[3], compiled.Ps);
-            File.WriteAllBytes(paths[4], compiled.VsCursor);
-            File.WriteAllBytes(paths[5], compiled.PsCursor);
+            File.WriteAllBytes(paths[2], compiled.PsPrepColor);
+            File.WriteAllBytes(paths[3], compiled.PsPrepMeta);
+            File.WriteAllBytes(paths[4], compiled.PsPole);
+            File.WriteAllBytes(paths[5], compiled.Ps);
+            File.WriteAllBytes(paths[6], compiled.VsCursor);
+            File.WriteAllBytes(paths[7], compiled.PsCursor);
         }
         catch (IOException)
         {
@@ -507,7 +551,7 @@ public sealed class EdgeSmoothingShader : IDisposable
                 return false;
             }
 
-            bytecode = new ShaderBytecode(data[0], data[1], data[2], data[3], data[4], data[5]);
+            bytecode = new ShaderBytecode(data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
             return true;
         }
         catch (IOException)
@@ -521,7 +565,7 @@ public sealed class EdgeSmoothingShader : IDisposable
     }
 
     private static byte[] Compile(string source, string entryPoint, string profile) =>
-        Compiler.Compile(source, entryPoint, HlslSourceName, profile, ShaderFlags.OptimizationLevel1).ToArray();
+        Compiler.Compile(source, entryPoint, HlslSourceName, profile, ShaderFlags.OptimizationLevel3).ToArray();
 
     private static string ReadEmbeddedHlsl()
     {

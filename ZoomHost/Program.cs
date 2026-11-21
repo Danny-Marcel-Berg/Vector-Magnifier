@@ -395,9 +395,17 @@ internal static class Program
                 bool shellCandidate = _activeShellHwnd != nint.Zero && _magInitialized && (showZoomedCursor || _invertColors);
                 if (!shellCandidate)
                 {
-                    // When stationary and already presented, block event-driven inside DXGI up to 4 ms:
-                    // wakes in < 0.1 ms on any desktop pixel update OR hardware mouse movement.
-                    bool canIdleWait = allowIdleWait && hasPresentedFrame && !camera.IsAnimating && capture.HasAcquiredFrame;
+                    // Peek cursor BEFORE blocking in DXGI AcquireNextFrame: when the OS hardware cursor
+                    // is hidden via MagShowSystemCursor(false), DXGI may not wake on mouse moves, so
+                    // sleeping 4 ms in AcquireNextFrame would add dead input lag to every mouse frame!
+                    bool mouseActive = (nowTicks - lastMouseMoveTicks) < 80;
+                    if (!mouseActive && GetCursorPos(out POINT peekCursor))
+                    {
+                        mouseActive = peekCursor.X != lastPresCursorX || peekCursor.Y != lastPresCursorY;
+                    }
+
+                    // Only wait inside DXGI when both mouse and desktop are genuinely idle.
+                    bool canIdleWait = allowIdleWait && hasPresentedFrame && !camera.IsAnimating && capture.HasAcquiredFrame && !mouseActive;
                     uint acquireTimeout = canIdleWait ? 4u : (capture.HasAcquiredFrame ? 0u : 8u);
                     capture.TryAcquireFrame(acquireTimeout, out _);
                 }
