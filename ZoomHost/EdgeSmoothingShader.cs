@@ -308,15 +308,15 @@ public sealed class EdgeSmoothingShader : IDisposable
         int x1 = Math.Clamp(reqX1 + panSlack, 0, desktopWidth);
         int y1 = Math.Clamp(reqY1 + panSlack, 0, desktopHeight);
 
-        int pcX0 = Math.Clamp(x0 - 16, 0, desktopWidth);
-        int pcY0 = Math.Clamp(y0 - 16, 0, desktopHeight);
-        int pcX1 = Math.Clamp(x1 + 16, 0, desktopWidth);
-        int pcY1 = Math.Clamp(y1 + 16, 0, desktopHeight);
+        int pcX0 = Math.Clamp(x0 - 24, 0, desktopWidth);
+        int pcY0 = Math.Clamp(y0 - 24, 0, desktopHeight);
+        int pcX1 = Math.Clamp(x1 + 24, 0, desktopWidth);
+        int pcY1 = Math.Clamp(y1 + 24, 0, desktopHeight);
 
-        int pmX0 = Math.Clamp(x0 - 13, 0, desktopWidth);
-        int pmY0 = Math.Clamp(y0 - 13, 0, desktopHeight);
-        int pmX1 = Math.Clamp(x1 + 13, 0, desktopWidth);
-        int pmY1 = Math.Clamp(y1 + 13, 0, desktopHeight);
+        int pmX0 = Math.Clamp(x0 - 21, 0, desktopWidth);
+        int pmY0 = Math.Clamp(y0 - 21, 0, desktopHeight);
+        int pmX1 = Math.Clamp(x1 + 21, 0, desktopWidth);
+        int pmY1 = Math.Clamp(y1 + 21, 0, desktopHeight);
 
         UnbindShaderResources();
         _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
@@ -484,18 +484,29 @@ public sealed class EdgeSmoothingShader : IDisposable
     {
         string source = ReadEmbeddedHlsl();
         string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("O3|" + source)));
-        string cacheDir = Path.Combine(
+        string portableCacheDir = Path.Combine(AppContext.BaseDirectory, "ShaderCache");
+        string localCacheDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ZoomText_Clone",
             "ShaderCache");
 
-        string[] paths = ["vs", "vscrop", "psprepcolor", "psprepmeta", "pspole", "ps", "vscursor", "pscursor"];
-        for (int i = 0; i < paths.Length; i++)
+        string[] names = ["vs", "vscrop", "psprepcolor", "psprepmeta", "pspole", "ps", "vscursor", "pscursor"];
+        string[] portablePaths = new string[names.Length];
+        string[] localPaths = new string[names.Length];
+        for (int i = 0; i < names.Length; i++)
         {
-            paths[i] = Path.Combine(cacheDir, $"{paths[i]}_{hash}.cso");
+            portablePaths[i] = Path.Combine(portableCacheDir, $"{names[i]}_{hash}.cso");
+            localPaths[i] = Path.Combine(localCacheDir, $"{names[i]}_{hash}.cso");
         }
 
-        if (TryReadCache(paths, out ShaderBytecode cached))
+        // 1) Portable USB-stick cache next to ZoomHost.exe: instant 0 ms load on any guest Windows PC!
+        if (TryReadCache(portablePaths, out ShaderBytecode cached))
+        {
+            return cached;
+        }
+
+        // 2) Local user AppData cache.
+        if (TryReadCache(localPaths, out cached))
         {
             return cached;
         }
@@ -512,24 +523,27 @@ public sealed class EdgeSmoothingShader : IDisposable
             () => psCursor = Compile(source, "PSCursor", "ps_5_0"));
         ShaderBytecode compiled = new(vs, vsCrop, psPrepColor, psPrepMeta, psPole, ps, vsCursor, psCursor);
 
-        try
+        foreach (string[] targetPaths in new[] { localPaths, portablePaths })
         {
-            Directory.CreateDirectory(cacheDir);
-            File.WriteAllBytes(paths[0], compiled.Vs);
-            File.WriteAllBytes(paths[1], compiled.VsCrop);
-            File.WriteAllBytes(paths[2], compiled.PsPrepColor);
-            File.WriteAllBytes(paths[3], compiled.PsPrepMeta);
-            File.WriteAllBytes(paths[4], compiled.PsPole);
-            File.WriteAllBytes(paths[5], compiled.Ps);
-            File.WriteAllBytes(paths[6], compiled.VsCursor);
-            File.WriteAllBytes(paths[7], compiled.PsCursor);
-        }
-        catch (IOException)
-        {
-            // Cache is an optimisation only.
-        }
-        catch (UnauthorizedAccessException)
-        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(targetPaths[0])!);
+                File.WriteAllBytes(targetPaths[0], compiled.Vs);
+                File.WriteAllBytes(targetPaths[1], compiled.VsCrop);
+                File.WriteAllBytes(targetPaths[2], compiled.PsPrepColor);
+                File.WriteAllBytes(targetPaths[3], compiled.PsPrepMeta);
+                File.WriteAllBytes(targetPaths[4], compiled.PsPole);
+                File.WriteAllBytes(targetPaths[5], compiled.Ps);
+                File.WriteAllBytes(targetPaths[6], compiled.VsCursor);
+                File.WriteAllBytes(targetPaths[7], compiled.PsCursor);
+            }
+            catch (IOException)
+            {
+                // Cache is an optimisation only (e.g. read-only USB stick already has portablePaths).
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
 
         return compiled;
