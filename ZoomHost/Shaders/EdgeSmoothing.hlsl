@@ -64,10 +64,10 @@ VSOut VSCropMain(uint id : SV_VertexID)
 static const float3 LumaWeights = float3(0.2126f, 0.7152f, 0.0722f);   // Rec.709
 static const float3 MeanWeights = float3(1.0f, 1.0f, 1.0f) / 3.0f;
 
-static const float EdgeContrastLo  = 0.035f;
-static const float EdgeContrastHi  = 0.095f;
-static const float LocalContrastLo = 0.02f;
-static const float LocalContrastHi = 0.08f;
+static const float EdgeContrastLo  = 0.018f;
+static const float EdgeContrastHi  = 0.060f;
+static const float LocalContrastLo = 0.015f;
+static const float LocalContrastHi = 0.065f;
 static const int   PoleRadius      = 3;       // 7x7 window: sees both opposite ClearType fringes across stems
 static const float TwoToneLo       = 0.54f;
 static const float TwoToneHi       = 0.76f;
@@ -235,9 +235,10 @@ PoleOut PolePS(VSOut input)
     float localC = max(l3Max - l3Min, max(c3Max.r - c3Min.r, max(c3Max.g - c3Min.g, c3Max.b - c3Min.b)));
     float wideC  = lMax - lMin;
 
-    // Fast early-out when the 7x7 window is flat OR when there is no 3x3 edge and only weak
-    // far shadow/ringing (< 18%), preventing outer halo/shadow skirts from flipping pole polarity.
-    if (wideC < 0.015f || (wideC < 0.18f && localC < 0.025f))
+    // Fast early-out when the 7x7 window OR the 3x3 local neighbourhood is flat:
+    // 0.025 (~6.4/255) early-outs on 6/255 3-row background gradient steps (preventing floating
+    // dark contour lines 3px from drop-shadows) while real text edges have localC >> 0.025.
+    if (wideC < 0.015f || localC < 0.025f)
     {
         float3 cCenter = FetchPercep(center).rgb;
         PoleOut flatOut;
@@ -254,6 +255,10 @@ PoleOut PolePS(VSOut input)
     float  bestDarkScore      = -1.0f;
     float3 bestLightAnchor    = 0.0f;
     float  bestLightScore     = -1.0f;
+    float3 darkPureSum        = 0.0f;
+    float  darkPureW          = 0.0f;
+    float3 lightPureSum       = 0.0f;
+    float  lightPureW         = 0.0f;
     float3 bestDarkInkAnchor  = 0.0f;
     float  bestDarkInkScore   = -1.0f;
     float3 bestLightInkAnchor = 0.0f;
@@ -300,7 +305,10 @@ PoleOut PolePS(VSOut input)
             bool  sameHueH  = (flags & 8u) != 0u;
 
             float notTouchingInk = 1.0f - smoothstep(0.16f * wideC, 0.34f * wideC, dMax);
-            float flat2D         = smoothstep(2.4f, 3.6f, sameCount) * notTouchingInk;
+            // Relative flatness fallback for text over steeper gradients or lightly textured backgrounds
+            // where absolute dMax >= 0.022 but dMax is still small compared to the text contrast wideC.
+            float relFlat        = (wideC > 0.22f) ? (0.45f * (1.0f - smoothstep(0.06f * wideC, 0.13f * wideC, dMax))) : 0.0f;
+            float flat2D         = max(smoothstep(2.4f, 3.6f, sameCount), relFlat) * notTouchingInk;
             float distSq         = (float)(x2 * x2 + y2 * y2);
             float distW          = 1.0f / (1.0f + 3.0f * distSq);
             float bgW            = flat2D * distW;
@@ -312,7 +320,13 @@ PoleOut PolePS(VSOut input)
                 if (u < 0.48f)
                 {
                     darkFlatW += bgW;
-                    if (pureFlat4) hasPureFlatDarkBg = true;
+                    if (pureFlat4)
+                    {
+                        hasPureFlatDarkBg = true;
+                        float pw = 1.0f / (1.0f + 0.35f * distSq);
+                        darkPureSum += c * pw;
+                        darkPureW   += pw;
+                    }
                     if (anchorScore > bestDarkScore)
                     {
                         bestDarkScore  = anchorScore;
@@ -322,7 +336,13 @@ PoleOut PolePS(VSOut input)
                 else if (u > 0.52f)
                 {
                     lightFlatW += bgW;
-                    if (pureFlat4) hasPureFlatLightBg = true;
+                    if (pureFlat4)
+                    {
+                        hasPureFlatLightBg = true;
+                        float pw = 1.0f / (1.0f + 0.35f * distSq);
+                        lightPureSum += c * pw;
+                        lightPureW   += pw;
+                    }
                     if (anchorScore > bestLightScore)
                     {
                         bestLightScore  = anchorScore;
@@ -441,12 +461,12 @@ PoleOut PolePS(VSOut input)
         static const int2 FarOffsets[16] = {
             int2( 0, -5), int2( 0,  5),
             int2(-5,  0), int2( 5,  0),
-            int2( 0, -7), int2( 0,  7),
-            int2(-4, -5), int2( 4,  5),
             int2( 0, -9), int2( 0,  9),
             int2(-9,  0), int2( 9,  0),
-            int2( 0,-12), int2( 0, 12),
-            int2(-12, 0), int2(12,  0)
+            int2(-7, -7), int2( 7,  7),
+            int2(-7,  7), int2( 7, -7),
+            int2( 0,-15), int2( 0, 15),
+            int2(-20, 0), int2(20,  0)
         };
         [loop]
         for (int p = 0; p < 16; ++p)
@@ -462,6 +482,9 @@ PoleOut PolePS(VSOut input)
                 if (uf < 0.48f)
                 {
                     polDarkW += fPolW;
+                    float fpw = 1.0f / (1.0f + 0.35f * fDistSq);
+                    darkPureSum += cf4.rgb * fpw;
+                    darkPureW   += fpw;
                     if (fScore > bestDarkScore)
                     {
                         bestDarkScore  = fScore;
@@ -471,6 +494,9 @@ PoleOut PolePS(VSOut input)
                 else if (uf > 0.52f)
                 {
                     polLightW += fPolW;
+                    float fpw = 1.0f / (1.0f + 0.35f * fDistSq);
+                    lightPureSum += cf4.rgb * fpw;
+                    lightPureW   += fpw;
                     if (fScore > bestLightScore)
                     {
                         bestLightScore  = fScore;
@@ -490,6 +516,22 @@ PoleOut PolePS(VSOut input)
 
     float3 darkBgExact  = (bestDarkScore  > 0.0f) ? bestDarkAnchor  : darkInkAvg;
     float3 lightBgExact = (bestLightScore > 0.0f) ? bestLightAnchor : lightInkAvg;
+
+    // On smooth gradient backgrounds (e.g. browser tabs, titlebars, ribbons), smoothly blend across
+    // nearby pure-flat background pixels so there is no abrupt step/box behind letters, while still
+    // snapping cleanly to bestAnchor whenever two distinct solid UI panels (> 0.14 apart) meet.
+    if (darkPureW > 0.0f && bestDarkScore > 0.0f)
+    {
+        float3 darkPureAvg = darkPureSum / darkPureW;
+        float  gradBlend   = 1.0f - smoothstep(0.09f, 0.16f, length(darkPureAvg - bestDarkAnchor));
+        darkBgExact = lerp(bestDarkAnchor, darkPureAvg, gradBlend);
+    }
+    if (lightPureW > 0.0f && bestLightScore > 0.0f)
+    {
+        float3 lightPureAvg = lightPureSum / lightPureW;
+        float  gradBlend    = 1.0f - smoothstep(0.09f, 0.16f, length(lightPureAvg - bestLightAnchor));
+        lightBgExact = lerp(bestLightAnchor, lightPureAvg, gradBlend);
+    }
 
     float darkChroma  = length(darkInkAvg  - dot(darkInkAvg,  LumaWeights));
     float lightChroma = length(lightInkAvg - dot(lightInkAvg, LumaWeights));
@@ -587,7 +629,8 @@ PoleOut PolePS(VSOut input)
         }
     }
 
-    float score      = (nearPole + exactPole + FringeBonus * fringePairs) / window;
+    float ctBonus    = (hasOppositeFringes && abs(subpixelVote) > 0.45f) ? 3.0f : 0.0f;
+    float score      = (nearPole + exactPole + FringeBonus * fringePairs + ctBonus) / window;
     float isNeutralPole = max(darkIsNeutralInk, lightIsNeutralInk);
     float ctStrength = saturate(abs(subpixelVote) * 0.6f) * neutralize * isNeutralPole;
     float ctDir      = (subpixelVote < -0.35f) ? 1.0f : (subpixelVote > 0.35f ? -1.0f : 0.0f);
@@ -601,16 +644,26 @@ PoleOut PolePS(VSOut input)
     return o;
 }
 
-float SampleGrayConnected(float2 pos, float lWideLo, float invWideC, float darkInk)
+// Projects 2x2 texels onto the true 3D RGB pole vector (wideLight - wideDark) instead of Rec.709
+// luma alone, giving coloured text (blue links, red/purple/orange/green syntax highlighting) full
+// signal-to-noise ratio across all active RGB channels + ink-connected diagonal triangulation
+// (guarded against false horizontal-bar-to-neighbour inter-letter bridges).
+float SampleInkAt(int2 coord, float3 wideDark, float3 spanRgb, float invSegLen2, float darkInk)
+{
+    float u = saturate(dot(FetchPercep(coord).rgb - wideDark, spanRgb) * invSegLen2);
+    return lerp(u, 1.0f - u, darkInk);
+}
+
+float SampleGrayConnected(float2 pos, float3 wideDark, float3 spanRgb, float invSegLen2, float darkInk)
 {
     float2 p  = pos - 0.5f;
     int2   i0 = int2(floor(p));
     float2 f  = p - floor(p);
 
-    float ua = saturate((FetchPercep(i0 + int2(0, 0)).a - lWideLo) * invWideC);
-    float ub = saturate((FetchPercep(i0 + int2(1, 0)).a - lWideLo) * invWideC);
-    float uc = saturate((FetchPercep(i0 + int2(0, 1)).a - lWideLo) * invWideC);
-    float ud = saturate((FetchPercep(i0 + int2(1, 1)).a - lWideLo) * invWideC);
+    float ua = saturate(dot(FetchPercep(i0 + int2(0, 0)).rgb - wideDark, spanRgb) * invSegLen2);
+    float ub = saturate(dot(FetchPercep(i0 + int2(1, 0)).rgb - wideDark, spanRgb) * invSegLen2);
+    float uc = saturate(dot(FetchPercep(i0 + int2(0, 1)).rgb - wideDark, spanRgb) * invSegLen2);
+    float ud = saturate(dot(FetchPercep(i0 + int2(1, 1)).rgb - wideDark, spanRgb) * invSegLen2);
 
     float uBilin = lerp(lerp(ua, ub, f.x), lerp(uc, ud, f.x), f.y);
 
@@ -619,22 +672,45 @@ float SampleGrayConnected(float2 pos, float lWideLo, float invWideC, float darkI
     float kc = lerp(uc, 1.0f - uc, darkInk);
     float kd = lerp(ud, 1.0f - ud, darkInk);
 
+    // Require both diagonal endpoints to be genuine ink (not a faint AA halo in an inter-letter gap).
+    float inkMin   = lerp(0.48f, 0.38f, darkInk);
     float mainDiag = min(ka, kd) - max(kb, kc);
     float antiDiag = min(kb, kc) - max(ka, kd);
 
-    if (mainDiag > 0.02f)
+    if (mainDiag > 0.02f && min(ka, kd) > inkMin)
     {
-        float uTri = (f.x > f.y)
-            ? ((1.0f - f.x) * ua + (f.x - f.y) * ub + f.y * ud)
-            : ((1.0f - f.y) * ua + (f.y - f.x) * uc + f.x * ud);
-        return lerp(uBilin, uTri, smoothstep(0.02f, 0.18f, mainDiag));
+        // Guard against bridging an isolated horizontal bar tip (e.g. 't' crossbar right tip) to an
+        // adjacent letter ('o' / 'r') across a diagonal gap: a real diagonal stroke does not start
+        // from a pure horizontal stub with empty space both above and diagonally behind it.
+        bool aHorizTip = (SampleInkAt(i0 + int2(-1, 0), wideDark, spanRgb, invSegLen2, darkInk) > 0.65f)
+                      && (SampleInkAt(i0 + int2( 0,-1), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f)
+                      && (SampleInkAt(i0 + int2(-1,-1), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f);
+        bool dHorizTip = (SampleInkAt(i0 + int2( 2, 1), wideDark, spanRgb, invSegLen2, darkInk) > 0.65f)
+                      && (SampleInkAt(i0 + int2( 1, 2), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f)
+                      && (SampleInkAt(i0 + int2( 2, 2), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f);
+        if (!aHorizTip && !dHorizTip)
+        {
+            float uTri = (f.x > f.y)
+                ? ((1.0f - f.x) * ua + (f.x - f.y) * ub + f.y * ud)
+                : ((1.0f - f.y) * ua + (f.y - f.x) * uc + f.x * ud);
+            return lerp(uBilin, uTri, smoothstep(0.02f, 0.18f, mainDiag));
+        }
     }
-    if (antiDiag > 0.02f)
+    if (antiDiag > 0.02f && min(kb, kc) > inkMin)
     {
-        float uTri = (f.x + f.y < 1.0f)
-            ? ((1.0f - f.x - f.y) * ua + f.x * ub + f.y * uc)
-            : ((1.0f - f.y) * ub + (1.0f - f.x) * uc + (f.x + f.y - 1.0f) * ud);
-        return lerp(uBilin, uTri, smoothstep(0.02f, 0.18f, antiDiag));
+        bool bHorizTip = (SampleInkAt(i0 + int2( 2, 0), wideDark, spanRgb, invSegLen2, darkInk) > 0.65f)
+                      && (SampleInkAt(i0 + int2( 1,-1), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f)
+                      && (SampleInkAt(i0 + int2( 2,-1), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f);
+        bool cHorizTip = (SampleInkAt(i0 + int2(-1, 1), wideDark, spanRgb, invSegLen2, darkInk) > 0.65f)
+                      && (SampleInkAt(i0 + int2( 0, 2), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f)
+                      && (SampleInkAt(i0 + int2(-1, 2), wideDark, spanRgb, invSegLen2, darkInk) < 0.35f);
+        if (!bHorizTip && !cHorizTip)
+        {
+            float uTri = (f.x + f.y < 1.0f)
+                ? ((1.0f - f.x - f.y) * ua + f.x * ub + f.y * uc)
+                : ((1.0f - f.y) * ub + (1.0f - f.x) * uc + (f.x + f.y - 1.0f) * ud);
+            return lerp(uBilin, uTri, smoothstep(0.02f, 0.18f, antiDiag));
+        }
     }
     return uBilin;
 }
@@ -643,9 +719,9 @@ float SampleCoverageFast(
     float2 pos,
     float2 invDesktop,
     float3 wideDark,
+    float3 spanRgb,
     float3 invSpan,
-    float  lWideLo,
-    float  invWideC,
+    float  invSegLen2,
     float  ctDir,
     float  useSubpixel,
     float  darkInk)
@@ -674,7 +750,7 @@ float SampleCoverageFast(
     }
     else
     {
-        return SampleGrayConnected(pos, lWideLo, invWideC, darkInk);
+        return SampleGrayConnected(pos, wideDark, spanRgb, invSegLen2, darkInk);
     }
 }
 
@@ -707,11 +783,13 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
     float  lWideHi   = dot(wideLight, LumaWeights);
     float  wideC     = lWideHi - lWideLo;
 
-    float invWideC = 1.0f / max(wideC, 1e-3f);
-    float3 spanRgb = wideLight - wideDark;
-    float minChanC = min(spanRgb.r, min(spanRgb.g, spanRgb.b));
-    float maxChanC = max(spanRgb.r, max(spanRgb.g, spanRgb.b));
-    float3 invSpan = 1.0f / max(spanRgb, 1e-3f);
+    float invWideC   = 1.0f / max(wideC, 1e-3f);
+    float3 spanRgb   = wideLight - wideDark;
+    float  segLen2   = max(dot(spanRgb, spanRgb), 1e-5f);
+    float  invSegLen2 = 1.0f / segLen2;
+    float minChanC   = min(spanRgb.r, min(spanRgb.g, spanRgb.b));
+    float maxChanC   = max(spanRgb.r, max(spanRgb.g, spanRgb.b));
+    float3 invSpan   = 1.0f / max(spanRgb, 1e-3f);
 
     float ctSigned    = localInfo.b * 2.0f - 1.0f;
     float useSubpixel = (abs(ctSigned) > 0.25f && minChanC > 0.15f && minChanC > 0.70f * maxChanC) ? 1.0f : 0.0f;
@@ -739,14 +817,16 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
     float onSegment = 1.0f;
     if (abs(ctSigned) <= 0.08f)
     {
-        float3 boxLo   = min(wideDark, wideLight) - 0.035f;
-        float3 boxHi   = max(wideDark, wideLight) + 0.035f;
-        float  segLen2 = max(dot(spanRgb, spanRgb), 1e-5f);
+        // Allow ClearType LCD subpixel sharpening undershoot (e.g. G or B dipping to 0 on coloured
+        // text over dark backgrounds like blue GitHub links) while keeping solid 3rd-colour icons
+        // outside [boxLo, boxHi] or caught by solidOffSegH.
+        float3 boxLo   = min(wideDark, wideLight) - 0.16f;
+        float3 boxHi   = max(wideDark, wideLight) + 0.05f;
 
-        float3 p00 = wideDark + spanRgb * (dot(c00 - wideDark, spanRgb) / segLen2);
-        float3 p10 = wideDark + spanRgb * (dot(c10 - wideDark, spanRgb) / segLen2);
-        float3 p01 = wideDark + spanRgb * (dot(c01 - wideDark, spanRgb) / segLen2);
-        float3 p11 = wideDark + spanRgb * (dot(c11 - wideDark, spanRgb) / segLen2);
+        float3 p00 = wideDark + spanRgb * (dot(c00 - wideDark, spanRgb) * invSegLen2);
+        float3 p10 = wideDark + spanRgb * (dot(c10 - wideDark, spanRgb) * invSegLen2);
+        float3 p01 = wideDark + spanRgb * (dot(c01 - wideDark, spanRgb) * invSegLen2);
+        float3 p11 = wideDark + spanRgb * (dot(c11 - wideDark, spanRgb) * invSegLen2);
 
         float3 r00 = c00 - p00;
         float3 r10 = c10 - p10;
@@ -785,9 +865,13 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
         onSegment = 1.0f - smoothstep(0.08f, 0.18f, maxSegErr);
     }
 
+    // Use max(wideC, maxChanC) so saturated coloured text (e.g. pure blue or red where Rec.709 luma
+    // contrast wideC is small even though RGB channel contrast maxChanC is high) AND low-contrast
+    // fading tab text both receive full vector contour sharpening.
+    float effectiveC = max(wideC, maxChanC * 0.65f);
     float edgeMask = twoTone
                    * onSegment
-                   * smoothstep(EdgeContrastLo, EdgeContrastHi, wideC);
+                   * smoothstep(EdgeContrastLo, EdgeContrastHi, effectiveC);
 
     float3 smoothRgb = 0.0f;
     if (edgeMask < 0.999f)
@@ -874,36 +958,73 @@ float3 ComputeMagnifiedRgb(float2 screenPos)
     float maxSpan = ((useSubpixel > 0.5f) ? 0.90f : 1.15f) * smoothScale;
     float span    = coherence * lerp(0.0f, maxSpan, diagFactor);
 
-    float uCenter = SampleCoverageFast(world, invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
+    float uCenter = SampleCoverageFast(world, invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
     float u = uCenter;
     if (span > 0.05f)
     {
-        float uM2 = SampleCoverageFast(world - tang * span,          invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
-        float uM1 = SampleCoverageFast(world - tang * (span * 0.5f), invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
-        float uP1 = SampleCoverageFast(world + tang * (span * 0.5f), invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
-        float uP2 = SampleCoverageFast(world + tang * span,          invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
+        float uM2 = SampleCoverageFast(world - tang * span,          invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
+        float uM1 = SampleCoverageFast(world - tang * (span * 0.5f), invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
+        float uP1 = SampleCoverageFast(world + tang * (span * 0.5f), invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
+        float uP2 = SampleCoverageFast(world + tang * span,          invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
         float uSmooth = 0.14f * (uM2 + uP2) + 0.22f * (uM1 + uP1) + 0.28f * uCenter;
 
-        float bgGap = (darkInk > 0.5f)
-            ? ((uCenter > 0.42f) ? max(0.0f, uCenter - max(uM1, uP1)) : 0.0f)
-            : ((uCenter < 0.58f) ? max(0.0f, min(uM1, uP1) - uCenter) : 0.0f);
-        float keepSmooth = 1.0f - smoothstep(0.03f, 0.12f, bgGap);
+        // Guard narrow inter-letter / counter background gaps (bgGap) AND tight 1px grayscale dark-ink
+        // corners/arches (inkPeak, e.g. 6pt downsampled text) so tangent smoothing keeps normal curves
+        // wave-free without fusing adjacent letters or erasing thin arcs.
+        float bgGap1 = (darkInk > 0.5f)
+            ? ((uCenter > 0.28f) ? max(0.0f, uCenter - max(uM1, uP1)) : 0.0f)
+            : ((uCenter < 0.72f) ? max(0.0f, min(uM1, uP1) - uCenter) : 0.0f);
+        float bgGap2 = (darkInk > 0.5f)
+            ? ((uCenter > 0.28f) ? max(0.0f, uCenter - max(uM2, uP2)) : 0.0f)
+            : ((uCenter < 0.72f) ? max(0.0f, min(uM2, uP2) - uCenter) : 0.0f);
+        float bgGap = max(bgGap1, bgGap2 * 0.55f);
+
+        float inkPeak = (useSubpixel < 0.5f && darkInk > 0.5f && uCenter < 0.58f)
+            ? max(0.0f, min(uM1, uP1) - uCenter)
+            : 0.0f;
+
+        float keepSmooth = (1.0f - smoothstep(0.025f, 0.10f, bgGap))
+                         * (1.0f - smoothstep(0.18f,  0.34f, inkPeak));
         u = lerp(uCenter, uSmooth, keepSmooth);
     }
 
     float epsX = (useSubpixel > 0.5f) ? 0.16f : 0.22f;
     float epsY = 0.22f;
-    float uNxP = SampleCoverageFast(world + float2(epsX, 0.0f), invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
-    float uNxM = SampleCoverageFast(world - float2(epsX, 0.0f), invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
-    float uNyP = SampleCoverageFast(world + float2(0.0f, epsY), invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
-    float uNyM = SampleCoverageFast(world - float2(0.0f, epsY), invDesktop, wideDark, invSpan, lWideLo, invWideC, ctDir, useSubpixel, darkInk);
+    float uNxP = SampleCoverageFast(world + float2(epsX, 0.0f), invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
+    float uNxM = SampleCoverageFast(world - float2(epsX, 0.0f), invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
+    float uNyP = SampleCoverageFast(world + float2(0.0f, epsY), invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
+    float uNyM = SampleCoverageFast(world - float2(0.0f, epsY), invDesktop, wideDark, spanRgb, invSpan, invSegLen2, ctDir, useSubpixel, darkInk);
     float2 uGrad = float2((uNxP - uNxM) / (2.0f * epsX), (uNyP - uNyM) / (2.0f * epsY));
 
     float uPerScreenPx = length(uGrad) / Zoom;
     float aa = max(uPerScreenPx, 1e-4f) * lerp(0.58f, 0.72f, saturate(Sharpness));
 
-    float baseThresh = 0.50f + 0.04f * (1.0f - darkInk) * useSubpixel;
+    // Grayscale AA & downsampled text (Chrome/Skia/DirectWrite/Google Docs) is blended in gamma-corrected
+    // space, so the true 50% geometric coverage contour sits above 0.50 in sRGB perceptual space:
+    // - For white-on-dark (darkInk=0), raising threshold thins bloated white strokes and separates letters.
+    // - For dark-on-light (darkInk=1), raising threshold restores eroded sub-pixel dark strokes (50% docs).
+    float grayMid    = pow(0.5f * (pow(max(lWideLo, 1e-4f), 1.48f) + pow(max(lWideHi, 1e-4f), 1.48f)), 1.0f / 1.48f);
+    float uGray50    = clamp((grayMid - lWideLo) * invWideC, 0.50f, 0.62f);
+    float baseThresh = (useSubpixel > 0.5f)
+        ? (0.50f + 0.04f * (1.0f - darkInk))
+        : uGray50;
     float threshold  = baseThresh + inkSign * MaxBoldShift * saturate(TextGamma);
+
+    // Recover sub-pixel-thin (< 1px) downsampled dark strokes (e.g. 50%-zoomed 6pt documents):
+    // fires only on narrow 1D dark ridges surrounded on BOTH sides by brighter background, so it
+    // never thickens normal >= 1.5px stems, never closes inter-letter gaps, and ignores drop shadows.
+    if (useSubpixel < 0.5f && darkInk > 0.5f)
+    {
+        float uL = saturate(dot(PercepTex.SampleLevel(LinearSamp, (world - float2(0.85f, 0.0f)) * invDesktop, 0).rgb - wideDark, spanRgb) * invSegLen2);
+        float uR = saturate(dot(PercepTex.SampleLevel(LinearSamp, (world + float2(0.85f, 0.0f)) * invDesktop, 0).rgb - wideDark, spanRgb) * invSegLen2);
+        float uU = saturate(dot(PercepTex.SampleLevel(LinearSamp, (world - float2(0.0f, 0.85f)) * invDesktop, 0).rgb - wideDark, spanRgb) * invSegLen2);
+        float uD = saturate(dot(PercepTex.SampleLevel(LinearSamp, (world + float2(0.0f, 0.85f)) * invDesktop, 0).rgb - wideDark, spanRgb) * invSegLen2);
+        float ridgeH   = max(0.0f, min(uL, uR) - uCenter);
+        float ridgeV   = max(0.0f, min(uU, uD) - uCenter);
+        float thinDark = smoothstep(0.10f, 0.28f, max(ridgeH, ridgeV))
+                       * smoothstep(0.76f, 0.50f, uCenter);
+        threshold += 0.10f * thinDark;
+    }
     float t = saturate((u - threshold) / aa + 0.5f);
 
     float3 contourRgb = lerp(wideDark, wideLight, t);
