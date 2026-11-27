@@ -205,21 +205,35 @@ public sealed class FocusTracker : IDisposable
             nint fg = GetForegroundWindow();
             lock (_stateLock)
             {
-                float dx = sx - _targetScreenX;
-                float dy = sy - _targetScreenY;
-                float distSq = dx * dx + dy * dy;
-
-                bool controlChanged = fg != _lastFocusHwnd || !string.Equals(controlKey, _lastControlKey, StringComparison.Ordinal);
-                bool movedEnough = !_hasTarget || distSq >= 2.25f; // >= 1.5 px
-
-                if (controlChanged || movedEnough || triggered)
+                if (!_hasTarget)
                 {
-                    bool largeJump = !_hasTarget || controlChanged || distSq > (96.0f * 96.0f);
                     _targetScreenX = sx;
                     _targetScreenY = sy;
                     _lastFocusHwnd = fg;
                     _lastControlKey = controlKey;
                     _hasTarget = true;
+                    if (triggered)
+                    {
+                        _pendingForceCenter = true;
+                        _sequence++;
+                    }
+                    continue;
+                }
+
+                float dx = sx - _targetScreenX;
+                float dy = sy - _targetScreenY;
+                float distSq = dx * dx + dy * dy;
+
+                bool controlChanged = fg != _lastFocusHwnd || !string.Equals(controlKey, _lastControlKey, StringComparison.Ordinal);
+                bool movedEnough = distSq >= 2.25f; // >= 1.5 px
+
+                if (controlChanged || movedEnough || triggered)
+                {
+                    bool largeJump = controlChanged || distSq > (96.0f * 96.0f);
+                    _targetScreenX = sx;
+                    _targetScreenY = sy;
+                    _lastFocusHwnd = fg;
+                    _lastControlKey = controlKey;
 
                     if (largeJump)
                     {

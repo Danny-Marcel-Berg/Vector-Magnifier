@@ -8,13 +8,16 @@ using static Vortice.Direct3D11.D3D11;
 
 namespace ZoomHost;
 
+public readonly record struct MonitorInfo(int OutputIndex, int OriginX, int OriginY, int Width, int Height);
+
 /// <summary>
 /// Captures the desktop background via the DXGI Desktop Duplication API (IDXGIOutputDuplication)
 /// into a persistent GPU texture with zero CPU readback.
 /// </summary>
 public sealed class CaptureEngine : IDisposable
 {
-    private readonly int _outputIndex;
+    private int _outputIndex;
+    private readonly List<MonitorInfo> _monitors = [];
     private readonly object _cpuLock = new();
     private IDXGIOutputDuplication? _duplication;
     private ID3D11Texture2D? _stagingTexture;
@@ -25,6 +28,9 @@ public sealed class CaptureEngine : IDisposable
     private long _lastStagingCopyTicks;
     private long _lastRecoveryAttemptTicks;
     private bool _disposed;
+
+    public int MonitorCount => _monitors.Count;
+    public int CurrentOutputIndex => _outputIndex;
 
     public ID3D11Device Device { get; }
     public ID3D11DeviceContext Context { get; }
@@ -76,7 +82,74 @@ public sealed class CaptureEngine : IDisposable
         DxgiDevice = Device.QueryInterface<IDXGIDevice>();
         DxgiAdapter = DxgiDevice.GetAdapter();
 
+        RefreshMonitors();
         InitializeDuplication();
+    }
+
+    public void RefreshMonitors()
+    {
+        _monitors.Clear();
+        for (uint i = 0; i < 16; i++)
+        {
+            Result hr = DxgiAdapter.EnumOutputs(i, out IDXGIOutput? output);
+            if (hr.Failure || output is null)
+            {
+                break;
+            }
+
+            using (output)
+            {
+                OutputDescription desc = output.Description;
+                RawRect b = desc.DesktopCoordinates;
+                if (desc.AttachedToDesktop && b.Right > b.Left && b.Bottom > b.Top)
+                {
+                    _monitors.Add(new MonitorInfo((int)i, b.Left, b.Top, b.Right - b.Left, b.Bottom - b.Top));
+                }
+            }
+        }
+    }
+
+    public bool TrySwitchOutputForPoint(int screenX, int screenY)
+    {
+        if (_disposed || _monitors.Count <= 1)
+        {
+            return false;
+        }
+
+        if (screenX >= OriginX && screenX < OriginX + DesktopWidth &&
+            screenY >= OriginY && screenY < OriginY + DesktopHeight)
+        {
+            return false;
+        }
+
+        foreach (MonitorInfo m in _monitors)
+        {
+            if (screenX >= m.OriginX && screenX < m.OriginX + m.Width &&
+                screenY >= m.OriginY && screenY < m.OriginY + m.Height &&
+                m.OutputIndex != _outputIndex)
+            {
+                int prevOutput = _outputIndex;
+                try
+                {
+                    _outputIndex = m.OutputIndex;
+                    _duplication?.Dispose();
+                    _duplication = null;
+                    HasAcquiredFrame = false;
+                    InitializeDuplication();
+                    DesktopFrameVersion++;
+                    return true;
+                }
+                catch
+                {
+                    _outputIndex = prevOutput;
+                    RefreshMonitors();
+                    RecoverDuplication();
+                    return false;
+                }
+            }
+        }
+
+        return false;
     }
 
     private void InitializeDuplication()
@@ -380,6 +453,7 @@ public sealed class CaptureEngine : IDisposable
         _duplication = null;
         try
         {
+            RefreshMonitors();
             InitializeDuplication();
         }
         catch

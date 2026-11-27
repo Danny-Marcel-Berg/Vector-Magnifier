@@ -29,6 +29,7 @@ internal static class Program
     private const uint WM_NCHITTEST = 0x0084;
     private static readonly nint HTTRANSPARENT = new(-1);
     private const uint WM_INPUT = 0x00FF;
+    private const uint WM_MOUSEMOVE = 0x0200;
     private const uint WM_HOTKEY = 0x0312;
     private const uint WM_LBUTTONDOWN = 0x0201;
     private const uint WM_RBUTTONDOWN = 0x0204;
@@ -96,15 +97,31 @@ internal static class Program
     private static FocusTracker? _focusTracker;
     private static ControlPanelWindow? _controlPanel;
     private static bool _vectorTextEnabled = true;
-    private static bool _invertColors = false;
+    private static int _colorMode = 0;
+    private static int _lastNonZeroColorMode = 1;
+    private static int _mediaMode = 0;
     private static float _gammaBoost = 0.0f;
     private static float _edgeSmoothing = 0.0f;
     private static float _cursorSizeScale = 1.0f;
     private static bool _invertCursor = false;
     private static bool _cursorFocusEnabled = true;
+    private static nint _hCursorIBeam;
+    private static nint _hCursorHand;
+    private static nint _hCursorSizeWE;
+    private static nint _hCursorSizeNS;
+    private static nint _hCursorSizeAll;
     private static long _lastKeyboardOrClickTicks = 0;
+    private static long _lastZoomActionTicks = 0;
+    private static long _zoomActionGeneration = 0;
     private static int _isZoomedForHooks = 0;
+    private static int _mainThreadSleeping = 0;
     private static bool _running = true;
+
+    private static void NotifyUserZoomAction()
+    {
+        Volatile.Write(ref _lastZoomActionTicks, Environment.TickCount64);
+        Interlocked.Increment(ref _zoomActionGeneration);
+    }
 
     private static nint _mouseHook = nint.Zero;
     private static LowLevelHookProc? _mouseHookProc;
@@ -133,6 +150,28 @@ internal static class Program
         return GetCursorPos(out POINT fresh)
             ? (fresh.X - _captureOriginX, fresh.Y - _captureOriginY)
             : (_fallbackCursorWorldX, _fallbackCursorWorldY);
+    }
+
+    private static VectorCursorShape DetectCursorShape()
+    {
+        if (_usedFallbackCursorHide)
+        {
+            return VectorCursorShape.Arrow;
+        }
+
+        CURSORINFO ci = default;
+        ci.cbSize = (uint)Marshal.SizeOf<CURSORINFO>();
+        if (!GetCursorInfo(ref ci) || ci.hCursor == nint.Zero)
+        {
+            return VectorCursorShape.Arrow;
+        }
+
+        if (ci.hCursor == _hCursorIBeam) return VectorCursorShape.IBeam;
+        if (ci.hCursor == _hCursorHand) return VectorCursorShape.Hand;
+        if (ci.hCursor == _hCursorSizeWE) return VectorCursorShape.SizeWE;
+        if (ci.hCursor == _hCursorSizeNS) return VectorCursorShape.SizeNS;
+        if (ci.hCursor == _hCursorSizeAll) return VectorCursorShape.SizeAll;
+        return VectorCursorShape.Arrow;
     }
 
     [STAThread]
@@ -180,6 +219,11 @@ internal static class Program
 
         _hInstance = GetModuleHandle(null);
         nint hInstance = _hInstance;
+        _hCursorIBeam = LoadCursor(nint.Zero, 32513);
+        _hCursorHand = LoadCursor(nint.Zero, 32649);
+        _hCursorSizeWE = LoadCursor(nint.Zero, 32644);
+        _hCursorSizeNS = LoadCursor(nint.Zero, 32645);
+        _hCursorSizeAll = LoadCursor(nint.Zero, 32646);
         string className = "VectorMagnifierOverlayClass";
 
         WNDCLASSEX wndClass = new()
@@ -265,11 +309,11 @@ internal static class Program
 
             controlPanel = new ControlPanelWindow(
                 ownerHwnd: hwnd,
-                onZoomIn: () => _camera.ZoomIn(),
-                onZoomOut: () => _camera.ZoomOut(),
-                onResetZoom: () => _camera.ResetZoom(),
+                onZoomIn: () => { NotifyUserZoomAction(); _camera.ZoomIn(); },
+                onZoomOut: () => { NotifyUserZoomAction(); _camera.ZoomOut(); },
+                onResetZoom: () => { NotifyUserZoomAction(); _camera.ResetZoom(); },
                 onVectorTextToggled: enabled => _vectorTextEnabled = enabled,
-                onGammaChanged: boost => _gammaBoost = Math.Clamp(boost, 0.0f, 1.0f),
+                onGammaChanged: boost => _gammaBoost = Math.Clamp(boost, -0.5f, 1.0f),
                 onExitRequested: () =>
                 {
                     RestoreSystemCursor();
@@ -279,7 +323,15 @@ internal static class Program
                 onModalRenderFrame: () => renderStep?.Invoke(),
                 onEdgeSmoothingChanged: smoothing => _edgeSmoothing = Math.Clamp(smoothing, 0.0f, 1.0f),
                 onMouseSizeChanged: size => _cursorSizeScale = Math.Clamp(size, 0.5f, 3.0f),
-                onInvertColorsChanged: inverted => _invertColors = inverted,
+                onColorModeChanged: mode =>
+                {
+                    _colorMode = Math.Clamp(mode, 0, 4);
+                    if (_colorMode != 0)
+                    {
+                        _lastNonZeroColorMode = _colorMode;
+                    }
+                },
+                onMediaModeChanged: mode => _mediaMode = Math.Clamp(mode, 0, 2),
                 onInvertCursorChanged: inverted => _invertCursor = inverted,
                 onCursorFocusChanged: enabled =>
                 {
@@ -303,6 +355,7 @@ internal static class Program
             bool wasZoomTextActive = false;
             bool preferCaretFocus = false;
             long lastFocusSequence = -1;
+            long lastZoomGeneration = Volatile.Read(ref _zoomActionGeneration);
             int mouseAnchorX = int.MinValue;
             int mouseAnchorY = int.MinValue;
             int prevCursorScreenX = int.MinValue;
@@ -326,7 +379,9 @@ internal static class Program
             bool lastPresShowCursor = false;
             float lastPresCursorScale = float.NaN;
             bool lastPresInvertCursor = false;
-            bool lastPresInvertColors = false;
+            int lastPresColorMode = 0;
+            int lastPresMediaMode = 0;
+            VectorCursorShape lastPresCursorShape = VectorCursorShape.Arrow;
             float lastPresEdgeSmoothing = float.NaN;
             float lastPresGamma = float.NaN;
             bool lastPresVectorText = false;
@@ -334,6 +389,7 @@ internal static class Program
             CursorSmoother cursorSmoother = new();
             Stopwatch stopwatch = Stopwatch.StartNew();
             double lastSeconds = stopwatch.Elapsed.TotalSeconds;
+            double lastPresentSeconds = 0.0;
 
             void StepAndRenderFrame(bool allowIdleWait)
             {
@@ -344,7 +400,7 @@ internal static class Program
 
                 bool showZoomedCursor = camera.Zoom > 1.001f || camera.TargetZoom > 1.001f;
                 bool showVectorCursor = showZoomedCursor || _invertCursor || MathF.Abs(_cursorSizeScale - 1.0f) > 0.02f;
-                bool needsOverlay = showZoomedCursor || showVectorCursor || _invertColors;
+                bool needsOverlay = showZoomedCursor || showVectorCursor || _colorMode != 0;
 
                 focusTracker.SetActive(showZoomedCursor && _cursorFocusEnabled);
                 Volatile.Write(ref _isZoomedForHooks, showZoomedCursor ? 1 : 0);
@@ -392,21 +448,24 @@ internal static class Program
                         capture.DesktopHeight);
                 }
 
-                bool shellCandidate = _activeShellHwnd != nint.Zero && _magInitialized && (showZoomedCursor || _invertColors);
+                bool shellCandidate = _activeShellHwnd != nint.Zero && _magInitialized && (showZoomedCursor || _colorMode != 0);
                 if (!shellCandidate)
                 {
-                    // Peek cursor BEFORE blocking in DXGI AcquireNextFrame: when the OS hardware cursor
-                    // is hidden via MagShowSystemCursor(false), DXGI may not wake on mouse moves, so
-                    // sleeping 4 ms in AcquireNextFrame would add dead input lag to every mouse frame!
-                    bool mouseActive = (nowTicks - lastMouseMoveTicks) < 80;
-                    if (!mouseActive && GetCursorPos(out POINT peekCursor))
+                    if (capture.MonitorCount > 1 && GetCursorPos(out POINT monPt) &&
+                        capture.TrySwitchOutputForPoint(monPt.X, monPt.Y))
                     {
-                        mouseActive = peekCursor.X != lastPresCursorX || peekCursor.Y != lastPresCursorY;
+                        SetWindowPos(hwnd, HWND_TOPMOST, capture.OriginX, capture.OriginY, capture.DesktopWidth, capture.DesktopHeight, SWP_NOACTIVATE);
+                        camera.Resize(capture.DesktopWidth, capture.DesktopHeight);
+                        renderer.Resize(capture.DesktopWidth, capture.DesktopHeight);
+                        camera.RequestCenterOnTarget();
+                        hasPresentedFrame = false;
+                        lastPresDesktopVer = -1;
+                        controlPanel?.EnsureTopmost();
                     }
 
-                    // Only wait inside DXGI when both mouse and desktop are genuinely idle.
-                    bool canIdleWait = allowIdleWait && hasPresentedFrame && !camera.IsAnimating && capture.HasAcquiredFrame && !mouseActive;
-                    uint acquireTimeout = canIdleWait ? 4u : (capture.HasAcquiredFrame ? 0u : 8u);
+                    // Never block in DXGI AcquireNextFrame once the first desktop frame is available;
+                    // idle sleeping happens in MsgWaitForMultipleObjectsEx where mouse moves wake at 0 ms.
+                    uint acquireTimeout = capture.HasAcquiredFrame ? 0u : 8u;
                     capture.TryAcquireFrame(acquireTimeout, out _);
                 }
 
@@ -447,19 +506,38 @@ internal static class Program
                     float targetY = outMouseWorldY;
                     float comfortRatio = 1.0f;
 
-                    bool mouseMovedSinceFocus = mouseAnchorX != int.MinValue &&
-                        (outCursorScreenX != mouseAnchorX || outCursorScreenY != mouseAnchorY);
-                    if (mouseMovedSinceFocus)
+                    long currentZoomGen = Volatile.Read(ref _zoomActionGeneration);
+                    if (currentZoomGen != lastZoomGeneration)
                     {
+                        lastZoomGeneration = currentZoomGen;
                         preferCaretFocus = false;
+                        mouseAnchorX = outCursorScreenX;
+                        mouseAnchorY = outCursorScreenY;
                     }
+                    else
+                    {
+                        bool mouseMovedSinceFocus = mouseAnchorX != int.MinValue &&
+                            (outCursorScreenX != mouseAnchorX || outCursorScreenY != mouseAnchorY);
+                        if (mouseMovedSinceFocus)
+                        {
+                            preferCaretFocus = false;
+                        }
+                    }
+
+                    bool zoomSuppressingCaret = camera.IsAnimating ||
+                        (nowTicks - Volatile.Read(ref _lastZoomActionTicks)) < 500;
 
                     if (_cursorFocusEnabled &&
                         showZoomedCursor &&
                         focusTracker.TryGetFocusTarget(capture.OriginX, capture.OriginY, capture.DesktopWidth, capture.DesktopHeight,
                             out float focusWorldX, out float focusWorldY, out bool forceCenter, out long focusSeq))
                     {
-                        if (focusSeq != lastFocusSequence)
+                        if (zoomSuppressingCaret)
+                        {
+                            lastFocusSequence = focusSeq;
+                            preferCaretFocus = false;
+                        }
+                        else if (focusSeq != lastFocusSequence)
                         {
                             lastFocusSequence = focusSeq;
                             bool recentUserIntent = (nowTicks - Volatile.Read(ref _lastKeyboardOrClickTicks)) <= 450;
@@ -493,7 +571,7 @@ internal static class Program
 
                 SampleAndUpdateCamera(out float mouseWorldX, out float mouseWorldY, out int cursorScreenX, out int cursorScreenY, out bool smoothCursor);
 
-                bool useShellMagnifier = (showZoomedCursor || _invertColors) && _activeShellHwnd != nint.Zero && _magInitialized;
+                bool useShellMagnifier = (showZoomedCursor || _colorMode != 0) && _activeShellHwnd != nint.Zero && _magInitialized;
                 if (useShellMagnifier)
                 {
                     float magZoom = showZoomedCursor ? camera.Zoom : 1.0f;
@@ -515,7 +593,7 @@ internal static class Program
                     if (MagSetFullscreenTransform(magZoom, offsetX, offsetY))
                     {
                         _magFullscreenApplied = true;
-                        ApplyMagColorInvert(_invertColors);
+                        ApplyMagColorInvert(_colorMode is 1 or 2 or 3);
                         hasPresentedFrame = false;
                         if (!_overlayHiddenForShell)
                         {
@@ -566,6 +644,7 @@ internal static class Program
                     if (capture.HasAcquiredFrame)
                     {
                         bool drawCursor = showVectorCursor && !cursorOccluded;
+                        VectorCursorShape cursorShape = drawCursor ? DetectCursorShape() : VectorCursorShape.Arrow;
                         bool overlayVisible = IsWindowVisible(hwnd);
 
                         bool needsRender =
@@ -576,22 +655,47 @@ internal static class Program
                             MathF.Abs(camera.FocusX - lastPresFocusX) > 0.0005f ||
                             MathF.Abs(camera.FocusY - lastPresFocusY) > 0.0005f ||
                             MathF.Abs(camera.Zoom - lastPresZoom) > 0.0005f ||
-                            (drawCursor && (cursorScreenX != lastPresCursorX || cursorScreenY != lastPresCursorY)) ||
+                            (drawCursor && (cursorScreenX != lastPresCursorX || cursorScreenY != lastPresCursorY || cursorShape != lastPresCursorShape)) ||
                             drawCursor != lastPresShowCursor ||
                             MathF.Abs(_cursorSizeScale - lastPresCursorScale) > 0.001f ||
                             _invertCursor != lastPresInvertCursor ||
-                            _invertColors != lastPresInvertColors ||
+                            _colorMode != lastPresColorMode ||
+                            _mediaMode != lastPresMediaMode ||
                             MathF.Abs(_edgeSmoothing - lastPresEdgeSmoothing) > 0.001f ||
                             MathF.Abs(_gammaBoost - lastPresGamma) > 0.001f ||
                             _vectorTextEnabled != lastPresVectorText;
 
                         if (needsRender)
                         {
-                            // Wait strictly 1:1 with Present(1) so MaximumFrameLatency=1 never queues stale frames.
+                            if (hasPresentedFrame)
+                            {
+                                bool fastCursorOnly =
+                                    !camera.IsAnimating &&
+                                    capture.DesktopFrameVersion == lastPresDesktopVer &&
+                                    MathF.Abs(camera.FocusX - lastPresFocusX) < 0.0005f &&
+                                    MathF.Abs(camera.FocusY - lastPresFocusY) < 0.0005f &&
+                                    MathF.Abs(camera.Zoom - lastPresZoom) < 0.0005f;
+                                double minIntervalMs = fastCursorOnly ? 3.5 : 7.0;
+                                double elapsedMs = (stopwatch.Elapsed.TotalSeconds - lastPresentSeconds) * 1000.0;
+                                if (elapsedMs < minIntervalMs)
+                                {
+                                    if (allowIdleWait && (minIntervalMs - elapsedMs) >= 1.5)
+                                    {
+                                        Thread.Sleep(1);
+                                    }
+                                    else
+                                    {
+                                        Thread.Yield();
+                                    }
+                                    return;
+                                }
+                            }
+
+                            // Wait strictly 1:1 with MaximumFrameLatency=1 so at most one GPU frame sits in flight.
                             renderer.WaitForNextFrame();
 
-                            // Immediately after VSync release, grab the freshest desktop frame & cursor position
-                            // so input-to-photon latency stays at the 1-frame hardware minimum.
+                            // Immediately before rendering, grab the freshest desktop frame & cursor position
+                            // so input-to-photon latency stays minimal.
                             capture.TryAcquireFrame(0, out _);
                             SampleAndUpdateCamera(out mouseWorldX, out mouseWorldY, out cursorScreenX, out cursorScreenY, out smoothCursor);
                             cursorOverControlPanel = !showZoomedCursor &&
@@ -603,6 +707,7 @@ internal static class Program
                                  (lastUnmovableTopWindow != nint.Zero &&
                                   IsPointInExpandedWindowRect(lastUnmovableTopWindow, cursorScreenX, cursorScreenY, marginPx: 16)));
                             drawCursor = showVectorCursor && !cursorOccluded;
+                            cursorShape = drawCursor ? DetectCursorShape() : VectorCursorShape.Arrow;
 
                             if (!overlayVisible)
                             {
@@ -626,9 +731,12 @@ internal static class Program
                                 edgeSmoothing: _edgeSmoothing,
                                 cursorSizeScale: _cursorSizeScale,
                                 invertCursor: _invertCursor,
-                                invertColors: _invertColors,
+                                colorMode: _colorMode,
+                                mediaMode: _mediaMode,
+                                cursorShape: cursorShape,
                                 sampleFreshCursor: smoothCursor ? null : SampleFreshCursorDelegate);
 
+                            lastPresentSeconds = stopwatch.Elapsed.TotalSeconds;
                             lastPresDesktopVer = capture.DesktopFrameVersion;
                             lastPresFocusX = camera.FocusX;
                             lastPresFocusY = camera.FocusY;
@@ -636,15 +744,26 @@ internal static class Program
                             lastPresCursorX = cursorScreenX;
                             lastPresCursorY = cursorScreenY;
                             lastPresShowCursor = drawCursor;
+                            lastPresCursorShape = cursorShape;
                             lastPresCursorScale = _cursorSizeScale;
                             lastPresInvertCursor = _invertCursor;
-                            lastPresInvertColors = _invertColors;
+                            lastPresColorMode = _colorMode;
+                            lastPresMediaMode = _mediaMode;
                             lastPresEdgeSmoothing = _edgeSmoothing;
                             lastPresGamma = _gammaBoost;
                             lastPresVectorText = _vectorTextEnabled;
                             hasPresentedFrame = true;
 
                             UpdateCursorVisibility(drawCursor && capture.HasAcquiredFrame);
+                        }
+                        else if (allowIdleWait)
+                        {
+                            Volatile.Write(ref _mainThreadSleeping, 1);
+                            if (!drawCursor || !GetCursorPos(out POINT recheck) || (recheck.X == lastPresCursorX && recheck.Y == lastPresCursorY))
+                            {
+                                MsgWaitForMultipleObjectsEx(0, nint.Zero, 4, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                            }
+                            Volatile.Write(ref _mainThreadSleeping, 0);
                         }
                     }
                     else
@@ -827,7 +946,17 @@ internal static class Program
         if (nCode >= 0)
         {
             uint msg = (uint)wParam;
-            // Fast-path exit for WM_MOUSEMOVE (99.9% of calls at up to 1000 Hz) with zero extra P/Invokes.
+            // Fast-path exit for WM_MOUSEMOVE (99.9% of calls at up to 1000 Hz): only wake main loop if idle-sleeping.
+            if (msg == WM_MOUSEMOVE)
+            {
+                if (Volatile.Read(ref _mainThreadSleeping) != 0 &&
+                    Interlocked.Exchange(ref _mainThreadSleeping, 0) != 0)
+                {
+                    PostThreadMessage(_mainThreadId, WM_NULL, nint.Zero, nint.Zero);
+                }
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+            }
+
             if (msg == WM_MOUSEWHEEL)
             {
                 if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
@@ -838,11 +967,13 @@ internal static class Program
 
                     if (wheelDelta > 0)
                     {
+                        NotifyUserZoomAction();
                         _camera?.ZoomIn();
                         PostThreadMessage(_mainThreadId, WM_NULL, nint.Zero, nint.Zero);
                     }
                     else if (wheelDelta < 0)
                     {
+                        NotifyUserZoomAction();
                         _camera?.ZoomOut();
                         PostThreadMessage(_mainThreadId, WM_NULL, nint.Zero, nint.Zero);
                     }
@@ -968,7 +1099,9 @@ internal static class Program
                 return HTTRANSPARENT;
 
             case WM_INPUT:
-                if (Volatile.Read(ref _isZoomedForHooks) != 0)
+                bool modifierHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+                                    (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                if (Volatile.Read(ref _isZoomedForHooks) != 0 && !modifierHeld)
                 {
                     Volatile.Write(ref _lastKeyboardOrClickTicks, Environment.TickCount64);
                     _focusTracker?.NotifyKeyboardActivity();
@@ -981,21 +1114,32 @@ internal static class Program
                 {
                     case HOTKEY_ZOOM_IN_MAIN:
                     case HOTKEY_ZOOM_IN_NUMPAD:
+                        NotifyUserZoomAction();
                         _camera?.ZoomIn();
                         break;
                     case HOTKEY_ZOOM_OUT_MAIN:
                     case HOTKEY_ZOOM_OUT_NUMPAD:
+                        NotifyUserZoomAction();
                         _camera?.ZoomOut();
                         break;
                     case HOTKEY_ZOOM_RESET_MAIN:
                     case HOTKEY_ZOOM_RESET_NUMPAD:
                     case HOTKEY_ZOOM_RESET_CTRLALT_MAIN:
                     case HOTKEY_ZOOM_RESET_CTRLALT_NUMPAD:
+                        NotifyUserZoomAction();
                         _camera?.ResetZoom();
                         break;
                     case HOTKEY_INVERT_COLORS:
-                        _invertColors = !_invertColors;
-                        _controlPanel?.SetInvertColors(_invertColors);
+                        if (_colorMode == 0)
+                        {
+                            _colorMode = _lastNonZeroColorMode != 0 ? _lastNonZeroColorMode : 1;
+                        }
+                        else
+                        {
+                            _lastNonZeroColorMode = _colorMode;
+                            _colorMode = 0;
+                        }
+                        _controlPanel?.SetColorMode(_colorMode);
                         break;
                     case HOTKEY_EXIT:
                         _running = false;
@@ -1031,6 +1175,8 @@ internal static class Program
         "TaskSwitcherWnd",
         "ForegroundStaging"
     ];
+
+    private static long _lastCrossBandScanTicks;
 
     private static void UpdateShellPopupState(
         nint overlayHwnd,
@@ -1073,6 +1219,13 @@ internal static class Program
             _activeShellHwnd = fg;
             return;
         }
+
+        long nowTicks = Environment.TickCount64;
+        if (_activeShellHwnd == nint.Zero && nowTicks - _lastCrossBandScanTicks < 250)
+        {
+            return;
+        }
+        _lastCrossBandScanTicks = nowTicks;
 
         // 2) Cross-band lookup via FindWindowEx: on Windows 10/11, EnumWindows and GetWindow(GW_HWNDPREV)
         //    explicitly filter out ZBID_IMMERSIVE bands (StartMenuExperienceHost / SearchHost) for non-UIAccess
@@ -1463,6 +1616,15 @@ internal static class Program
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct CURSORINFO
+    {
+        public uint cbSize;
+        public uint flags;
+        public nint hCursor;
+        public POINT ptScreenPos;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct RAWINPUTDEVICE
     {
         public ushort usUsagePage;
@@ -1577,6 +1739,12 @@ internal static class Program
 
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorInfo(ref CURSORINFO pci);
+
+    [DllImport("user32.dll")]
+    private static extern nint LoadCursor(nint hInstance, int lpCursorName);
 
     [DllImport("user32.dll")]
     private static extern nint GetWindow(nint hWnd, uint uCmd);

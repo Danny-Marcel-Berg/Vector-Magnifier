@@ -90,7 +90,7 @@ public sealed class VectorRenderer : IDisposable
     private ID2D1Bitmap1? _desktopBitmap;
     private ID3D11Texture2D? _trackedTexture;
     private IDWriteRenderingParams? _textRenderingParams;
-    private float _appliedTextGamma = -1.0f;
+    private float _appliedTextGamma = float.NaN;
     private nint _frameLatencyWaitable;
     private bool _hasCachedZoomFrame;
     private long _cachedDesktopVersion = -1;
@@ -103,7 +103,8 @@ public sealed class VectorRenderer : IDisposable
     private float _cachedZoom;
     private float _cachedEdgeSmoothing;
     private float _cachedGammaBoost;
-    private bool _cachedInvertColors;
+    private int _cachedColorMode;
+    private int _cachedMediaMode;
 
     private long _lastValidationTicks;
     private long _lastPpsTicks = Environment.TickCount64;
@@ -112,6 +113,8 @@ public sealed class VectorRenderer : IDisposable
     private float _prevCursorFocusX = float.NaN;
     private float _prevCursorFocusY = float.NaN;
     private float _prevCursorZoom = float.NaN;
+    private int _consecutiveDesktopUpdates;
+    private long _lastSeenDesktopVersion = -1;
 
     public long TotalReceivedPackets { get; private set; }
     public int ActiveVectorTextCount { get; private set; }
@@ -163,7 +166,7 @@ public sealed class VectorRenderer : IDisposable
             Stereo = false,
             SampleDescription = new SampleDescription(1, 0),
             BufferUsage = Usage.RenderTargetOutput,
-            BufferCount = 2,
+            BufferCount = 3,
             Scaling = Scaling.Stretch,
             SwapEffect = SwapEffect.FlipDiscard,
             AlphaMode = Vortice.DXGI.AlphaMode.Ignore,
@@ -269,8 +272,37 @@ public sealed class VectorRenderer : IDisposable
         _cachedZoomTex = null;
         _hasCachedZoomFrame = false;
 
-        _swapChain.ResizeBuffers(2, (uint)width, (uint)height, _swapFormat, SwapChainFlags.FrameLatencyWaitableObject);
+        _swapChain.ResizeBuffers(3, (uint)width, (uint)height, _swapFormat, SwapChainFlags.FrameLatencyWaitableObject);
         CreateSwapChainTargetBitmap();
+    }
+
+    private void EnsureCachedZoomTarget(int bbW, int bbH)
+    {
+        if (_cachedZoomTex is not null && _cachedBackBufferW == bbW && _cachedBackBufferH == bbH)
+        {
+            return;
+        }
+
+        _cachedZoomRtv?.Dispose();
+        _cachedZoomRtv = null;
+        _cachedZoomTex?.Dispose();
+        Texture2DDescription cacheDesc = new()
+        {
+            Width = (uint)bbW,
+            Height = (uint)bbH,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = _swapFormat,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+            CPUAccessFlags = CpuAccessFlags.None,
+            MiscFlags = ResourceOptionFlags.None
+        };
+        _cachedZoomTex = _d3dDevice.CreateTexture2D(cacheDesc);
+        _cachedZoomRtv = _d3dDevice.CreateRenderTargetView(_cachedZoomTex);
+        _cachedBackBufferW = bbW;
+        _cachedBackBufferH = bbH;
     }
 
     private void EnsureDesktopBitmap(ID3D11Texture2D? sharedTexture)
@@ -699,7 +731,7 @@ public sealed class VectorRenderer : IDisposable
 
     private void UpdateTextGammaParams(float textGamma)
     {
-        float clamped = Math.Clamp(textGamma, 0.0f, 1.0f);
+        float clamped = Math.Clamp(textGamma, -0.5f, 1.0f);
         if (MathF.Abs(clamped - _appliedTextGamma) < 0.001f)
         {
             return;
@@ -710,11 +742,11 @@ public sealed class VectorRenderer : IDisposable
         _textRenderingParams?.Dispose();
         _textRenderingParams = null;
 
-        if (clamped > 0.0001f)
+        if (MathF.Abs(clamped) > 0.0001f)
         {
             // 0 = default system text gamma; increasing gently tunes DirectWrite glyph edge gamma & contrast (text-only)
-            float gamma = 1.8f + clamped * 0.60f;
-            float enhancedContrast = clamped * 0.35f;
+            float gamma = Math.Clamp(1.8f + clamped * 0.60f, 1.4f, 2.4f);
+            float enhancedContrast = Math.Clamp(clamped * 0.35f, 0.0f, 0.35f);
             _textRenderingParams = _dwriteFactory.CreateCustomRenderingParams(
                 gamma,
                 enhancedContrast,
@@ -736,7 +768,9 @@ public sealed class VectorRenderer : IDisposable
         float edgeSmoothing = 0.0f,
         float cursorSizeScale = 1.0f,
         bool invertCursor = false,
-        bool invertColors = false,
+        int colorMode = 0,
+        int mediaMode = 0,
+        VectorCursorShape cursorShape = VectorCursorShape.Arrow,
         Func<(float x, float y)>? sampleFreshCursor = null)
     {
         if (_disposed)
@@ -753,6 +787,16 @@ public sealed class VectorRenderer : IDisposable
         _prevCursorFocusX = camera.FocusX;
         _prevCursorFocusY = camera.FocusY;
         _prevCursorZoom = camera.Zoom;
+
+        if (capture.DesktopFrameVersion != _lastSeenDesktopVersion)
+        {
+            _lastSeenDesktopVersion = capture.DesktopFrameVersion;
+            _consecutiveDesktopUpdates = Math.Min(_consecutiveDesktopUpdates + 1, 4);
+        }
+        else
+        {
+            _consecutiveDesktopUpdates = 0;
+        }
 
         bool copiedDirect = false;
         if (vectorTextEnabled && camera.Zoom > 1.001f && capture.SharedDesktopTexture is not null && _backBufferTex is not null)
@@ -773,13 +817,14 @@ public sealed class VectorRenderer : IDisposable
                 MathF.Abs(_cachedZoom - camera.Zoom) < 0.0001f &&
                 MathF.Abs(_cachedEdgeSmoothing - edgeSmoothing) < 0.0001f &&
                 MathF.Abs(_cachedGammaBoost - gammaBoost) < 0.0001f &&
-                _cachedInvertColors == invertColors;
+                _cachedColorMode == colorMode &&
+                _cachedMediaMode == mediaMode;
 
             if (cacheHit)
             {
                 _d3dContext.CopyResource(_backBufferTex, _cachedZoomTex!);
             }
-            else if (!viewportStationary)
+            else if (!viewportStationary || _consecutiveDesktopUpdates >= 2)
             {
                 // Actively panning/zooming: render directly to the swapchain backbuffer to avoid
                 // an extra 15-30 MB VRAM copy every single frame at 120 Hz.
@@ -794,34 +839,13 @@ public sealed class VectorRenderer : IDisposable
                     isHdr: capture.IsHdrDesktop,
                     sdrWhiteScale: capture.SdrWhiteScale,
                     desktopVersion: capture.DesktopFrameVersion,
-                    invertColors: invertColors);
+                    colorMode: colorMode,
+                    mediaMode: mediaMode);
                 _hasCachedZoomFrame = false;
             }
             else
             {
-                if (_cachedZoomTex is null || _cachedBackBufferW != bbW || _cachedBackBufferH != bbH)
-                {
-                    _cachedZoomRtv?.Dispose();
-                    _cachedZoomRtv = null;
-                    _cachedZoomTex?.Dispose();
-                    Texture2DDescription cacheDesc = new()
-                    {
-                        Width = (uint)bbW,
-                        Height = (uint)bbH,
-                        MipLevels = 1,
-                        ArraySize = 1,
-                        Format = _swapFormat,
-                        SampleDescription = new SampleDescription(1, 0),
-                        Usage = ResourceUsage.Default,
-                        BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
-                        CPUAccessFlags = CpuAccessFlags.None,
-                        MiscFlags = ResourceOptionFlags.None
-                    };
-                    _cachedZoomTex = _d3dDevice.CreateTexture2D(cacheDesc);
-                    _cachedZoomRtv = _d3dDevice.CreateRenderTargetView(_cachedZoomTex);
-                    _cachedBackBufferW = bbW;
-                    _cachedBackBufferH = bbH;
-                }
+                EnsureCachedZoomTarget(bbW, bbH);
 
                 // Stationary viewport: render into cached zoomed texture so cursor-only frames skip the shader.
                 _edgeShader.Render(
@@ -835,7 +859,8 @@ public sealed class VectorRenderer : IDisposable
                     isHdr: capture.IsHdrDesktop,
                     sdrWhiteScale: capture.SdrWhiteScale,
                     desktopVersion: capture.DesktopFrameVersion,
-                    invertColors: invertColors);
+                    colorMode: colorMode,
+                    mediaMode: mediaMode);
 
                 _cachedDesktopVersion = capture.DesktopFrameVersion;
                 _cachedDesktopW = capture.DesktopWidth;
@@ -845,7 +870,8 @@ public sealed class VectorRenderer : IDisposable
                 _cachedZoom = camera.Zoom;
                 _cachedEdgeSmoothing = edgeSmoothing;
                 _cachedGammaBoost = gammaBoost;
-                _cachedInvertColors = invertColors;
+                _cachedColorMode = colorMode;
+                _cachedMediaMode = mediaMode;
                 _hasCachedZoomFrame = true;
                 _d3dContext.CopyResource(_backBufferTex, _cachedZoomTex!);
             }
@@ -855,29 +881,82 @@ public sealed class VectorRenderer : IDisposable
         else if (camera.Zoom <= 1.001f &&
                  capture.SharedDesktopTexture is not null && _backBufferTex is not null)
         {
-            if (!invertColors &&
+            if (colorMode == 0 &&
                 capture.SharedDesktopTexture.Description.Format == _swapFormat &&
                 capture.SharedDesktopTexture.Description.Width == _backBufferTex.Description.Width &&
                 capture.SharedDesktopTexture.Description.Height == _backBufferTex.Description.Height)
             {
-                // SDR 1.0x without inversion: bit-for-bit identical copy into the swapchain backbuffer
+                // SDR 1.0x without colour filter: bit-for-bit identical copy into the swapchain backbuffer
                 _d3dContext.CopyResource(_backBufferTex, capture.SharedDesktopTexture);
             }
             else if (_backBufferRtv is not null)
             {
-                // HDR 1.0x or inverted 1.0x: 1-tap exact passthrough (+ optional colour inversion)
-                _edgeShader.Render(
-                    _backBufferRtv,
-                    capture.SharedDesktopTexture,
-                    camera,
-                    capture.DesktopWidth,
-                    capture.DesktopHeight,
-                    sharpness: edgeSmoothing,
-                    gammaBoost: gammaBoost,
-                    isHdr: capture.IsHdrDesktop,
-                    sdrWhiteScale: capture.SdrWhiteScale,
-                    desktopVersion: capture.DesktopFrameVersion,
-                    invertColors: invertColors);
+                int bbW = (int)_backBufferTex.Description.Width;
+                int bbH = (int)_backBufferTex.Description.Height;
+                bool cacheHit1x =
+                    _hasCachedZoomFrame &&
+                    _cachedZoomTex is not null &&
+                    _cachedBackBufferW == bbW &&
+                    _cachedBackBufferH == bbH &&
+                    _cachedDesktopVersion == capture.DesktopFrameVersion &&
+                    _cachedDesktopW == capture.DesktopWidth &&
+                    _cachedDesktopH == capture.DesktopHeight &&
+                    _cachedZoom <= 1.001f &&
+                    _cachedColorMode == colorMode;
+
+                if (cacheHit1x)
+                {
+                    _d3dContext.CopyResource(_backBufferTex, _cachedZoomTex!);
+                }
+                else if (_consecutiveDesktopUpdates >= 2)
+                {
+                    // Active desktop stream at 1.0x HDR/filtered: render directly to swapchain backbuffer.
+                    _edgeShader.Render(
+                        _backBufferRtv,
+                        capture.SharedDesktopTexture,
+                        camera,
+                        capture.DesktopWidth,
+                        capture.DesktopHeight,
+                        sharpness: edgeSmoothing,
+                        gammaBoost: gammaBoost,
+                        isHdr: capture.IsHdrDesktop,
+                        sdrWhiteScale: capture.SdrWhiteScale,
+                        desktopVersion: capture.DesktopFrameVersion,
+                        colorMode: colorMode,
+                        mediaMode: mediaMode);
+                    _hasCachedZoomFrame = false;
+                }
+                else
+                {
+                    // Static desktop at 1.0x HDR/filtered: cache converted SDR frame so cursor moves are a fast VRAM copy.
+                    EnsureCachedZoomTarget(bbW, bbH);
+                    _edgeShader.Render(
+                        _cachedZoomRtv!,
+                        capture.SharedDesktopTexture,
+                        camera,
+                        capture.DesktopWidth,
+                        capture.DesktopHeight,
+                        sharpness: edgeSmoothing,
+                        gammaBoost: gammaBoost,
+                        isHdr: capture.IsHdrDesktop,
+                        sdrWhiteScale: capture.SdrWhiteScale,
+                        desktopVersion: capture.DesktopFrameVersion,
+                        colorMode: colorMode,
+                        mediaMode: mediaMode);
+
+                    _cachedDesktopVersion = capture.DesktopFrameVersion;
+                    _cachedDesktopW = capture.DesktopWidth;
+                    _cachedDesktopH = capture.DesktopHeight;
+                    _cachedFocusX = 0.0f;
+                    _cachedFocusY = 0.0f;
+                    _cachedZoom = 1.0f;
+                    _cachedEdgeSmoothing = edgeSmoothing;
+                    _cachedGammaBoost = gammaBoost;
+                    _cachedColorMode = colorMode;
+                    _cachedMediaMode = mediaMode;
+                    _hasCachedZoomFrame = true;
+                    _d3dContext.CopyResource(_backBufferTex, _cachedZoomTex!);
+                }
             }
             copiedDirect = true;
         }
@@ -915,7 +994,8 @@ public sealed class VectorRenderer : IDisposable
                     cursorScale,
                     invertCursor,
                     _isHdrDesktop,
-                    _sdrWhiteScale);
+                    _sdrWhiteScale,
+                    cursorShape);
             }
         }
         else
@@ -971,7 +1051,7 @@ public sealed class VectorRenderer : IDisposable
             _d2dContext.EndDraw();
         }
 
-        _swapChain.Present(1, PresentFlags.None);
+        _swapChain.Present(0, PresentFlags.None);
     }
 
     private void RenderVectorTextPass(CameraController camera)

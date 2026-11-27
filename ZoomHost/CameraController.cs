@@ -34,6 +34,10 @@ public sealed class CameraController
     public float TargetZoom { get; private set; } = 1.0f;
     private bool _centerUntilSettled;
     private bool _centerExplicitTarget;
+    private bool _zoomAnchoring;
+    private bool _needsAnchorCapture;
+    private float _anchorScreenX;
+    private float _anchorScreenY;
 
     public bool IsAnimating
     {
@@ -41,7 +45,7 @@ public sealed class CameraController
         {
             lock (_stateLock)
             {
-                return MathF.Abs(TargetZoom - Zoom) > 0.001f || _centerUntilSettled;
+                return MathF.Abs(TargetZoom - Zoom) > 0.001f || _centerUntilSettled || _zoomAnchoring;
             }
         }
     }
@@ -79,6 +83,17 @@ public sealed class CameraController
         return 12.0f + (index - (BaseZoomSteps.Length - 1)) * 4.0f;
     }
 
+    private void ActivateMouseAnchor()
+    {
+        _centerUntilSettled = false;
+        _centerExplicitTarget = false;
+        if (!_zoomAnchoring)
+        {
+            _zoomAnchoring = true;
+            _needsAnchorCapture = true;
+        }
+    }
+
     public void ZoomIn()
     {
         lock (_stateLock)
@@ -89,13 +104,13 @@ public sealed class CameraController
                 if (step >= MaxZoom)
                 {
                     TargetZoom = MaxZoom;
-                    _centerUntilSettled = true;
+                    ActivateMouseAnchor();
                     return;
                 }
                 if (step > TargetZoom + 0.01f)
                 {
                     TargetZoom = Math.Clamp(step, MinZoom, MaxZoom);
-                    _centerUntilSettled = true;
+                    ActivateMouseAnchor();
                     return;
                 }
             }
@@ -113,14 +128,14 @@ public sealed class CameraController
                 if (step >= TargetZoom - 0.01f)
                 {
                     TargetZoom = Math.Clamp(prev, MinZoom, MaxZoom);
-                    _centerUntilSettled = true;
+                    ActivateMouseAnchor();
                     return;
                 }
                 prev = step;
                 if (step >= MaxZoom)
                 {
                     TargetZoom = MaxZoom;
-                    _centerUntilSettled = true;
+                    ActivateMouseAnchor();
                     return;
                 }
             }
@@ -132,7 +147,7 @@ public sealed class CameraController
         lock (_stateLock)
         {
             TargetZoom = Math.Clamp(TargetZoom * factor, MinZoom, MaxZoom);
-            _centerUntilSettled = true;
+            ActivateMouseAnchor();
         }
     }
 
@@ -142,6 +157,8 @@ public sealed class CameraController
         lock (_stateLock)
         {
             TargetZoom = Math.Clamp(zoom, MinZoom, MaxZoom);
+            _zoomAnchoring = false;
+            _needsAnchorCapture = false;
             _centerUntilSettled = true;
         }
     }
@@ -150,6 +167,8 @@ public sealed class CameraController
     {
         lock (_stateLock)
         {
+            _zoomAnchoring = false;
+            _needsAnchorCapture = false;
             _centerUntilSettled = true;
             _centerExplicitTarget = true;
         }
@@ -161,6 +180,8 @@ public sealed class CameraController
         {
             TargetZoom = MinZoom;
             Zoom = MinZoom;
+            _zoomAnchoring = false;
+            _needsAnchorCapture = false;
             _centerUntilSettled = false;
             _centerExplicitTarget = false;
             ClampFocus();
@@ -174,9 +195,28 @@ public sealed class CameraController
         {
             float dt = Math.Clamp(deltaTime, 0.0f, 0.033f);
 
-            // Smoothly interpolate zoom level
+            // Capture the cursor's current screen-space anchor BEFORE changing Zoom so zooming
+            // keeps the exact world point under the mouse cursor stationary on screen.
+            if (_zoomAnchoring && _needsAnchorCapture)
+            {
+                if (Zoom <= MinZoom + 0.001f)
+                {
+                    _anchorScreenX = Math.Clamp(mouseWorldX, 0.0f, ScreenWidth);
+                    _anchorScreenY = Math.Clamp(mouseWorldY, 0.0f, ScreenHeight);
+                }
+                else
+                {
+                    _anchorScreenX = Math.Clamp((mouseWorldX - FocusX) * Zoom + ScreenWidth * 0.5f, 0.0f, ScreenWidth);
+                    _anchorScreenY = Math.Clamp((mouseWorldY - FocusY) * Zoom + ScreenHeight * 0.5f, 0.0f, ScreenHeight);
+                }
+                _needsAnchorCapture = false;
+            }
+
+            // Smoothly interpolate zoom level logarithmically for perceptually uniform speed.
             float zoomAlpha = 1.0f - MathF.Exp(-ZoomSmoothingSpeed * dt);
-            Zoom = Math.Clamp(Zoom + (TargetZoom - Zoom) * zoomAlpha, MinZoom, MaxZoom);
+            float logZoom = MathF.Log(MathF.Max(Zoom, MinZoom));
+            float logTarget = MathF.Log(MathF.Max(TargetZoom, MinZoom));
+            Zoom = Math.Clamp(MathF.Exp(logZoom + (logTarget - logZoom) * zoomAlpha), MinZoom, MaxZoom);
             if (MathF.Abs(TargetZoom - Zoom) < 0.001f)
             {
                 Zoom = TargetZoom;
@@ -190,6 +230,19 @@ public sealed class CameraController
             float maxFocusX = MathF.Max(halfViewW, ScreenWidth - halfViewW);
             float minFocusY = halfViewH;
             float maxFocusY = MathF.Max(halfViewH, ScreenHeight - halfViewH);
+
+            if (_zoomAnchoring)
+            {
+                FocusX = Math.Clamp(mouseWorldX - (_anchorScreenX - ScreenWidth * 0.5f) / Zoom, minFocusX, maxFocusX);
+                FocusY = Math.Clamp(mouseWorldY - (_anchorScreenY - ScreenHeight * 0.5f) / Zoom, minFocusY, maxFocusY);
+                if (MathF.Abs(TargetZoom - Zoom) <= 0.001f)
+                {
+                    _zoomAnchoring = false;
+                }
+                ClampFocus();
+                RecalculateMatrix();
+                return;
+            }
 
             // Center onto cursor ONLY while zooming (or explicit FocusTracker jump);
             // once zoom settles, switch immediately to true edge-panning so the cursor moves

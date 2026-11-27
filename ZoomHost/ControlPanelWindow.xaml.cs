@@ -31,7 +31,8 @@ public partial class ControlPanelWindow : Window
     private readonly Action<float> _onGammaChanged;
     private readonly Action<float>? _onEdgeSmoothingChanged;
     private readonly Action<float>? _onMouseSizeChanged;
-    private readonly Action<bool>? _onInvertColorsChanged;
+    private readonly Action<int>? _onColorModeChanged;
+    private readonly Action<int>? _onMediaModeChanged;
     private readonly Action<bool>? _onInvertCursorChanged;
     private readonly Action<bool>? _onCursorFocusChanged;
     private readonly Action _onExitRequested;
@@ -60,7 +61,8 @@ public partial class ControlPanelWindow : Window
         Action? onModalRenderFrame = null,
         Action<float>? onEdgeSmoothingChanged = null,
         Action<float>? onMouseSizeChanged = null,
-        Action<bool>? onInvertColorsChanged = null,
+        Action<int>? onColorModeChanged = null,
+        Action<int>? onMediaModeChanged = null,
         Action<bool>? onInvertCursorChanged = null,
         Action<bool>? onCursorFocusChanged = null,
         AppSettings? settings = null)
@@ -81,7 +83,8 @@ public partial class ControlPanelWindow : Window
         _onGammaChanged = onGammaChanged;
         _onEdgeSmoothingChanged = onEdgeSmoothingChanged;
         _onMouseSizeChanged = onMouseSizeChanged;
-        _onInvertColorsChanged = onInvertColorsChanged;
+        _onColorModeChanged = onColorModeChanged;
+        _onMediaModeChanged = onMediaModeChanged;
         _onInvertCursorChanged = onInvertCursorChanged;
         _onCursorFocusChanged = onCursorFocusChanged;
         _onExitRequested = onExitRequested;
@@ -120,7 +123,8 @@ public partial class ControlPanelWindow : Window
             GammaSlider.Value = _settings.Gamma;
             MouseSizeSlider.Value = _settings.MouseSize;
             VectorTextEnabledCheckBox.IsChecked = _settings.VectorText;
-            InvertColorsCheckBox.IsChecked = _settings.InvertColors;
+            ColorModeComboBox.SelectedIndex = Math.Clamp(_settings.ColorMode, 0, 4);
+            MediaModeComboBox.SelectedIndex = Math.Clamp(_settings.MediaMode, 0, 2);
             InvertCursorCheckBox.IsChecked = _settings.InvertCursor;
             CursorFocusCheckBox.IsChecked = _settings.CursorFocus;
 
@@ -129,7 +133,8 @@ public partial class ControlPanelWindow : Window
             _onGammaChanged?.Invoke((float)(_settings.Gamma / 100.0));
             _onMouseSizeChanged?.Invoke((float)(_settings.MouseSize / 100.0));
             _onVectorTextToggled?.Invoke(_settings.VectorText);
-            _onInvertColorsChanged?.Invoke(_settings.InvertColors);
+            _onColorModeChanged?.Invoke(_settings.ColorMode);
+            _onMediaModeChanged?.Invoke(_settings.MediaMode);
             _onInvertCursorChanged?.Invoke(_settings.InvertCursor);
             _onCursorFocusChanged?.Invoke(_settings.CursorFocus);
 
@@ -329,7 +334,9 @@ public partial class ControlPanelWindow : Window
         }
 
         double val = e.NewValue;
-        GammaValueText.Text = val < 0.5 ? "0 (Normal)" : $"+{val:0}";
+        GammaValueText.Text = Math.Abs(val) < 0.5
+            ? "0 (Normal)"
+            : (val > 0 ? $"+{val:0}" : $"{val:0}");
         _onGammaChanged?.Invoke((float)(val / 100.0));
         Remember(() => _settings.Gamma = val);
     }
@@ -360,9 +367,10 @@ public partial class ControlPanelWindow : Window
         Remember(() => _settings.MouseSize = val);
     }
 
-    public void SetInvertColors(bool enabled)
+    public void SetColorMode(int mode)
     {
-        if (InvertColorsCheckBox.IsChecked == enabled)
+        int clamped = Math.Clamp(mode, 0, 4);
+        if (ColorModeComboBox.SelectedIndex == clamped)
         {
             return;
         }
@@ -370,21 +378,46 @@ public partial class ControlPanelWindow : Window
         _applyingSettings = true;
         try
         {
-            InvertColorsCheckBox.IsChecked = enabled;
+            ColorModeComboBox.SelectedIndex = clamped;
         }
         finally
         {
             _applyingSettings = false;
         }
 
-        Remember(() => _settings.InvertColors = enabled);
+        Remember(() =>
+        {
+            _settings.ColorMode = clamped;
+            _settings.InvertColors = clamped == 1;
+        });
     }
 
-    private void InvertColors_Changed(object sender, RoutedEventArgs e)
+    private void ColorModeComboBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
-        bool on = InvertColorsCheckBox.IsChecked == true;
-        _onInvertColorsChanged?.Invoke(on);
-        Remember(() => _settings.InvertColors = on);
+        if (ColorModeComboBox is null || ColorModeComboBox.SelectedIndex < 0)
+        {
+            return;
+        }
+
+        int mode = Math.Clamp(ColorModeComboBox.SelectedIndex, 0, 4);
+        _onColorModeChanged?.Invoke(mode);
+        Remember(() =>
+        {
+            _settings.ColorMode = mode;
+            _settings.InvertColors = mode == 1;
+        });
+    }
+
+    private void MediaModeComboBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (MediaModeComboBox is null || MediaModeComboBox.SelectedIndex < 0)
+        {
+            return;
+        }
+
+        int mode = Math.Clamp(MediaModeComboBox.SelectedIndex, 0, 2);
+        _onMediaModeChanged?.Invoke(mode);
+        Remember(() => _settings.MediaMode = mode);
     }
 
     private void InvertCursor_Changed(object sender, RoutedEventArgs e)

@@ -29,7 +29,7 @@ public sealed class EdgeSmoothingShader : IDisposable
     /// <summary>Extra texels around the visible area: bilinear pole footprint (1) plus safety.</summary>
     private const int ViewMargin = 4;
 
-    // Must match the cbuffer "Params" layout in EdgeSmoothing.hlsl (16-byte aligned, 64 bytes).
+    // Must match the cbuffer "Params" layout in EdgeSmoothing.hlsl (16-byte aligned, 80 bytes).
     [StructLayout(LayoutKind.Sequential)]
     private struct ShaderParams
     {
@@ -44,11 +44,15 @@ public sealed class EdgeSmoothingShader : IDisposable
         public float TextGamma;
         public float IsHdr;
         public float SdrWhiteScale;
-        public float InvertColors;
+        public float ColorMode;
         public float CropMinU;
         public float CropMinV;
         public float CropMaxU;
         public float CropMaxV;
+        public float MediaMode;
+        public float Pad0;
+        public float Pad1;
+        public float Pad2;
     }
 
     // Must match the cbuffer "CursorParams" layout in EdgeSmoothing.hlsl (16-byte aligned, 64 bytes).
@@ -61,13 +65,13 @@ public sealed class EdgeSmoothingShader : IDisposable
         public float StrokeHalfWidth;
         public float ScreenWidth;
         public float ScreenHeight;
-        private float _pad0;
+        public float CursorShape;
         private float _pad1;
         public float FillR, FillG, FillB, FillA;
         public float StrokeR, StrokeG, StrokeB, StrokeA;
     }
 
-    private readonly record struct ShaderBytecode(byte[] Vs, byte[] VsCrop, byte[] PsPrepColor, byte[] PsPrepMeta, byte[] PsPole, byte[] Ps, byte[] VsCursor, byte[] PsCursor);
+    private readonly record struct ShaderBytecode(byte[] Vs, byte[] VsCrop, byte[] PsPrepColor, byte[] PsPrepMeta, byte[] PsPole, byte[] PsMediaMask, byte[] Ps, byte[] VsCursor, byte[] PsCursor);
 
     private readonly record struct RenderTarget(ID3D11Texture2D Texture, ID3D11RenderTargetView Rtv, ID3D11ShaderResourceView Srv) : IDisposable
     {
@@ -86,6 +90,7 @@ public sealed class EdgeSmoothingShader : IDisposable
     private readonly ID3D11PixelShader _psPrepColor;
     private readonly ID3D11PixelShader _psPrepMeta;
     private readonly ID3D11PixelShader _psPole;
+    private readonly ID3D11PixelShader _psMediaMask;
     private readonly ID3D11PixelShader _ps;
     private readonly ID3D11VertexShader _vsCursor;
     private readonly ID3D11PixelShader _psCursor;
@@ -99,17 +104,19 @@ public sealed class EdgeSmoothingShader : IDisposable
     private ID3D11Texture2D? _trackedTexture;
     private ID3D11ShaderResourceView? _desktopSrv;
 
-    // Pre-pass and pole pass outputs (t1..t5 in PolePS / PSMain).
+    // Pre-pass, pole pass, and half-res media mask outputs (t1..t6 in MediaMaskPS / PSMain).
     private RenderTarget? _percepTex;
     private RenderTarget? _metaTex;
     private RenderTarget? _poleDark;
     private RenderTarget? _poleLight;
     private RenderTarget? _localExt;
+    private RenderTarget? _mediaMask;
     private int _poleWidth;
     private int _poleHeight;
     private Format _poleFormat;
 
     private bool _hasPoles;
+    private bool _hasMediaMask;
     private long _polesDesktopVersion = -1;
     private int _polesX0, _polesY0, _polesX1, _polesY1;
     private bool _disposed;
@@ -125,6 +132,7 @@ public sealed class EdgeSmoothingShader : IDisposable
         _psPrepColor = _device.CreatePixelShader(bytecode.PsPrepColor);
         _psPrepMeta = _device.CreatePixelShader(bytecode.PsPrepMeta);
         _psPole = _device.CreatePixelShader(bytecode.PsPole);
+        _psMediaMask = _device.CreatePixelShader(bytecode.PsMediaMask);
         _ps = _device.CreatePixelShader(bytecode.Ps);
         _vsCursor = _device.CreateVertexShader(bytecode.VsCursor);
         _psCursor = _device.CreatePixelShader(bytecode.PsCursor);
@@ -170,7 +178,8 @@ public sealed class EdgeSmoothingShader : IDisposable
         bool isHdr = false,
         float sdrWhiteScale = 1.0f,
         long desktopVersion = -1,
-        bool invertColors = false)
+        int colorMode = 0,
+        int mediaMode = 0)
     {
         if (_disposed)
         {
@@ -195,11 +204,11 @@ public sealed class EdgeSmoothingShader : IDisposable
         if (camera.Zoom > PassthroughZoom)
         {
             EnsurePoleTargets(desktopWidth, desktopHeight, isHdr);
-            UpdatePolesIfNeeded(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, desktopVersion);
+            UpdatePolesIfNeeded(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, desktopVersion, mediaMode);
         }
 
         // Magnify pass
-        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, invertColors,
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, colorMode, mediaMode,
             _polesX0, _polesY0, _polesX1, _polesY1);
         _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         _context.RSSetViewport(0, 0, camera.ScreenWidth, camera.ScreenHeight);
@@ -213,6 +222,7 @@ public sealed class EdgeSmoothingShader : IDisposable
             _context.PSSetShaderResource(2, _poleLight!.Value.Srv);
             _context.PSSetShaderResource(3, _localExt!.Value.Srv);
             _context.PSSetShaderResource(4, _percepTex!.Value.Srv);
+            _context.PSSetShaderResource(6, _mediaMask!.Value.Srv);
         }
         _context.Draw(3, 0);
 
@@ -229,7 +239,8 @@ public sealed class EdgeSmoothingShader : IDisposable
         float cursorScale,
         bool invertCursor,
         bool isHdr,
-        float sdrWhiteScale)
+        float sdrWhiteScale,
+        VectorCursorShape cursorShape = VectorCursorShape.Arrow)
     {
         if (_disposed)
         {
@@ -251,6 +262,7 @@ public sealed class EdgeSmoothingShader : IDisposable
             p->StrokeHalfWidth = 0.625f;
             p->ScreenWidth = screenWidth;
             p->ScreenHeight = screenHeight;
+            p->CursorShape = (float)(int)cursorShape;
             p->FillR = fill; p->FillG = fill; p->FillB = fill; p->FillA = 1.0f;
             p->StrokeR = stroke; p->StrokeG = stroke; p->StrokeB = stroke; p->StrokeA = 1.0f;
         }
@@ -282,7 +294,7 @@ public sealed class EdgeSmoothingShader : IDisposable
 
     private void UpdatePolesIfNeeded(
         CameraController camera, int desktopWidth, int desktopHeight,
-        float sharpness, float gammaBoost, bool isHdr, float sdrWhiteScale, long desktopVersion)
+        float sharpness, float gammaBoost, bool isHdr, float sdrWhiteScale, long desktopVersion, int mediaMode)
     {
         // Visible desktop rectangle (texels) plus the footprint the magnify pass reads.
         float halfW = camera.ScreenWidth * 0.5f / camera.Zoom;
@@ -298,11 +310,20 @@ public sealed class EdgeSmoothingShader : IDisposable
             reqX0 >= _polesX0 && reqY0 >= _polesY0 && reqX1 <= _polesX1 && reqY1 <= _polesY1;
         if (upToDate)
         {
+            if (mediaMode == 0 && !_hasMediaMask)
+            {
+                UnbindShaderResources();
+                RenderMediaMaskPass(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, _polesX0, _polesY0, _polesX1, _polesY1);
+            }
             return;
         }
 
-        // Prepare a bit more than visible so small pans do not trigger a new pole pass.
-        int panSlack = camera.Zoom >= 8.0f ? 128 : camera.Zoom >= 4.0f ? 72 : camera.Zoom >= 2.5f ? 32 : 16;
+        // Dynamic panSlack: during live video/typing (desktopVersion changed) keep slack compact so
+        // PolePS runs on 3x fewer pixels; when panning on a static desktop keep generous slack.
+        bool desktopChanged = !_hasPoles || desktopVersion != _polesDesktopVersion;
+        int panSlack = desktopChanged
+            ? (mediaMode == 0 ? 16 : 8)
+            : (camera.Zoom >= 8.0f ? 144 : camera.Zoom >= 4.0f ? 96 : camera.Zoom >= 2.0f ? 80 : 48);
         int x0 = Math.Clamp(reqX0 - panSlack, 0, desktopWidth);
         int y0 = Math.Clamp(reqY0 - panSlack, 0, desktopHeight);
         int x1 = Math.Clamp(reqX1 + panSlack, 0, desktopWidth);
@@ -324,7 +345,7 @@ public sealed class EdgeSmoothingShader : IDisposable
         _context.VSSetShader(_vsCrop);
 
         // Pass 0a: Convert raw desktop (HDR/SDR) -> perceptual sRGB + luma once per pixel.
-        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, pcX0, pcY0, pcX1, pcY1);
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, 0, 0, pcX0, pcY0, pcX1, pcY1);
         _context.OMSetRenderTargets(_percepTex!.Value.Rtv);
         _context.PSSetShader(_psPrepColor);
         _context.PSSetShaderResource(0, _desktopSrv!);
@@ -332,7 +353,7 @@ public sealed class EdgeSmoothingShader : IDisposable
         _context.OMSetRenderTargets((ID3D11RenderTargetView)null!);
 
         // Pass 0b: Precompute 4-neighbour RGB flatness + ClearType fringe flags once per pixel.
-        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, pmX0, pmY0, pmX1, pmY1);
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, 0, 0, pmX0, pmY0, pmX1, pmY1);
         _context.OMSetRenderTargets(_metaTex!.Value.Rtv);
         _context.PSSetShader(_psPrepMeta);
         _context.PSSetShaderResource(4, _percepTex!.Value.Srv);
@@ -340,7 +361,7 @@ public sealed class EdgeSmoothingShader : IDisposable
         _context.OMSetRenderTargets((ID3D11RenderTargetView)null!);
 
         // Pass 1: Zero-spill PolePS reading strictly from PercepTex (t4) + MetaTex (t5).
-        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, false, x0, y0, x1, y1);
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, 0, 0, x0, y0, x1, y1);
         _context.OMSetRenderTargets([_poleDark!.Value.Rtv, _poleLight!.Value.Rtv, _localExt!.Value.Rtv]);
         _context.PSSetShader(_psPole);
         _context.PSSetShaderResource(4, _percepTex!.Value.Srv);
@@ -348,9 +369,40 @@ public sealed class EdgeSmoothingShader : IDisposable
         _context.Draw(4, 0);
         _context.OMSetRenderTargets([(ID3D11RenderTargetView)null!, null!, null!]);
 
+        if (mediaMode == 0)
+        {
+            RenderMediaMaskPass(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, x0, y0, x1, y1);
+        }
+        else
+        {
+            _hasMediaMask = false;
+        }
+
         (_polesX0, _polesY0, _polesX1, _polesY1) = (x0, y0, x1, y1);
         _polesDesktopVersion = desktopVersion;
         _hasPoles = true;
+    }
+
+    private void RenderMediaMaskPass(
+        CameraController camera, int desktopWidth, int desktopHeight,
+        float sharpness, float gammaBoost, bool isHdr, float sdrWhiteScale,
+        int x0, int y0, int x1, int y1)
+    {
+        int mediaW = (int)_mediaMask!.Value.Texture.Description.Width;
+        int mediaH = (int)_mediaMask!.Value.Texture.Description.Height;
+        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+        _context.RSSetViewport(0, 0, mediaW, mediaH);
+        _context.VSSetShader(_vsCrop);
+        WriteConstants(camera, desktopWidth, desktopHeight, sharpness, gammaBoost, isHdr, sdrWhiteScale, 0, 0, x0, y0, x1, y1);
+        _context.OMSetRenderTargets(_mediaMask!.Value.Rtv);
+        _context.PSSetShader(_psMediaMask);
+        _context.PSSetShaderResource(1, _poleDark!.Value.Srv);
+        _context.PSSetShaderResource(2, _poleLight!.Value.Srv);
+        _context.PSSetShaderResource(3, _localExt!.Value.Srv);
+        _context.PSSetShaderResource(5, _metaTex!.Value.Srv);
+        _context.Draw(4, 0);
+        _context.OMSetRenderTargets((ID3D11RenderTargetView)null!);
+        _hasMediaMask = true;
     }
 
     private void UnbindShaderResources()
@@ -362,6 +414,7 @@ public sealed class EdgeSmoothingShader : IDisposable
         _context.PSSetShaderResource(3, null!);
         _context.PSSetShaderResource(4, null!);
         _context.PSSetShaderResource(5, null!);
+        _context.PSSetShaderResource(6, null!);
     }
 
     private void EnsurePoleTargets(int desktopWidth, int desktopHeight, bool isHdr)
@@ -389,13 +442,20 @@ public sealed class EdgeSmoothingShader : IDisposable
             BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource
         };
 
+        Texture2DDescription mediaDesc = desc;
+        mediaDesc.Width = (uint)Math.Max(1, (desktopWidth + 1) / 2);
+        mediaDesc.Height = (uint)Math.Max(1, (desktopHeight + 1) / 2);
+        mediaDesc.Format = Format.R8G8_UNorm;
+
         _percepTex = CreateRenderTarget(desc);
         _metaTex = CreateRenderTarget(desc);
         _poleDark = CreateRenderTarget(desc);
         _poleLight = CreateRenderTarget(desc);
         _localExt = CreateRenderTarget(desc);
+        _mediaMask = CreateRenderTarget(mediaDesc);
         (_poleWidth, _poleHeight, _poleFormat) = (desktopWidth, desktopHeight, format);
         _hasPoles = false;
+        _hasMediaMask = false;
     }
 
     private RenderTarget CreateRenderTarget(Texture2DDescription desc)
@@ -411,12 +471,14 @@ public sealed class EdgeSmoothingShader : IDisposable
         _poleDark?.Dispose(); _poleDark = null;
         _poleLight?.Dispose(); _poleLight = null;
         _localExt?.Dispose(); _localExt = null;
+        _mediaMask?.Dispose(); _mediaMask = null;
         _hasPoles = false;
+        _hasMediaMask = false;
     }
 
     private unsafe void WriteConstants(
         CameraController camera, int desktopWidth, int desktopHeight,
-        float sharpness, float gammaBoost, bool isHdr, float sdrWhiteScale, bool invertColors,
+        float sharpness, float gammaBoost, bool isHdr, float sdrWhiteScale, int colorMode, int mediaMode,
         int cropX0, int cropY0, int cropX1, int cropY1)
     {
         float invW = 1.0f / Math.Max(1, desktopWidth);
@@ -434,14 +496,18 @@ public sealed class EdgeSmoothingShader : IDisposable
             p->ScreenHeight = camera.ScreenHeight;
             p->DesktopWidth = desktopWidth;
             p->DesktopHeight = desktopHeight;
-            p->TextGamma = Math.Clamp(gammaBoost, 0.0f, 1.0f);
+            p->TextGamma = Math.Clamp(gammaBoost, -0.5f, 1.0f);
             p->IsHdr = isHdr ? 1.0f : 0.0f;
             p->SdrWhiteScale = MathF.Max(0.25f, sdrWhiteScale);
-            p->InvertColors = invertColors ? 1.0f : 0.0f;
+            p->ColorMode = colorMode;
             p->CropMinU = cropX0 * invW;
             p->CropMinV = cropY0 * invH;
             p->CropMaxU = cropX1 * invW;
             p->CropMaxV = cropY1 * invH;
+            p->MediaMode = mediaMode;
+            p->Pad0 = 0.0f;
+            p->Pad1 = 0.0f;
+            p->Pad2 = 0.0f;
         }
         finally
         {
@@ -468,6 +534,7 @@ public sealed class EdgeSmoothingShader : IDisposable
         _psCursor.Dispose();
         _vsCursor.Dispose();
         _ps.Dispose();
+        _psMediaMask.Dispose();
         _psPole.Dispose();
         _psPrepMeta.Dispose();
         _psPrepColor.Dispose();
@@ -490,7 +557,7 @@ public sealed class EdgeSmoothingShader : IDisposable
             "ZoomText_Clone",
             "ShaderCache");
 
-        string[] names = ["vs", "vscrop", "psprepcolor", "psprepmeta", "pspole", "ps", "vscursor", "pscursor"];
+        string[] names = ["vs", "vscrop", "psprepcolor", "psprepmeta", "pspole", "psmediamask", "ps", "vscursor", "pscursor"];
         string[] portablePaths = new string[names.Length];
         string[] localPaths = new string[names.Length];
         for (int i = 0; i < names.Length; i++)
@@ -511,17 +578,18 @@ public sealed class EdgeSmoothingShader : IDisposable
             return cached;
         }
 
-        byte[] vs = [], vsCrop = [], psPrepColor = [], psPrepMeta = [], psPole = [], ps = [], vsCursor = [], psCursor = [];
+        byte[] vs = [], vsCrop = [], psPrepColor = [], psPrepMeta = [], psPole = [], psMediaMask = [], ps = [], vsCursor = [], psCursor = [];
         System.Threading.Tasks.Parallel.Invoke(
             () => vs = Compile(source, "VSMain", "vs_5_0"),
             () => vsCrop = Compile(source, "VSCropMain", "vs_5_0"),
             () => psPrepColor = Compile(source, "PrepColorPS", "ps_5_0"),
             () => psPrepMeta = Compile(source, "PrepMetaPS", "ps_5_0"),
             () => psPole = Compile(source, "PolePS", "ps_5_0"),
+            () => psMediaMask = Compile(source, "MediaMaskPS", "ps_5_0"),
             () => ps = Compile(source, "PSMain", "ps_5_0"),
             () => vsCursor = Compile(source, "VSCursor", "vs_5_0"),
             () => psCursor = Compile(source, "PSCursor", "ps_5_0"));
-        ShaderBytecode compiled = new(vs, vsCrop, psPrepColor, psPrepMeta, psPole, ps, vsCursor, psCursor);
+        ShaderBytecode compiled = new(vs, vsCrop, psPrepColor, psPrepMeta, psPole, psMediaMask, ps, vsCursor, psCursor);
 
         foreach (string[] targetPaths in new[] { localPaths, portablePaths })
         {
@@ -533,9 +601,10 @@ public sealed class EdgeSmoothingShader : IDisposable
                 File.WriteAllBytes(targetPaths[2], compiled.PsPrepColor);
                 File.WriteAllBytes(targetPaths[3], compiled.PsPrepMeta);
                 File.WriteAllBytes(targetPaths[4], compiled.PsPole);
-                File.WriteAllBytes(targetPaths[5], compiled.Ps);
-                File.WriteAllBytes(targetPaths[6], compiled.VsCursor);
-                File.WriteAllBytes(targetPaths[7], compiled.PsCursor);
+                File.WriteAllBytes(targetPaths[5], compiled.PsMediaMask);
+                File.WriteAllBytes(targetPaths[6], compiled.Ps);
+                File.WriteAllBytes(targetPaths[7], compiled.VsCursor);
+                File.WriteAllBytes(targetPaths[8], compiled.PsCursor);
             }
             catch (IOException)
             {
@@ -565,7 +634,7 @@ public sealed class EdgeSmoothingShader : IDisposable
                 return false;
             }
 
-            bytecode = new ShaderBytecode(data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+            bytecode = new ShaderBytecode(data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8]);
             return true;
         }
         catch (IOException)

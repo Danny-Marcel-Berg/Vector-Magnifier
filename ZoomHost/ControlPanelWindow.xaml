@@ -7,7 +7,9 @@
         WindowStyle="SingleBorderWindow"
         ResizeMode="CanMinimize"
         Background="#FF16181E"
-        ShowInTaskbar="True">
+        ShowInTaskbar="True"
+        TextOptions.TextRenderingMode="Grayscale"
+        TextOptions.TextFormattingMode="Ideal">
 
     <ScrollViewer VerticalScrollBarVisibility="Auto"
                   HorizontalScrollBarVisibility="Disabled"
@@ -198,7 +200,7 @@
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="Text-Gamma (0 = Normal)"
+                            <TextBlock Text="Strichstärke / Text-Gamma"
                                        Foreground="#FFE2E8F0"
                                        FontWeight="Normal"
                                        FontSize="12"
@@ -212,14 +214,14 @@
                                        VerticalAlignment="Center"/>
                         </Grid>
                         <Slider x:Name="GammaSlider"
-                                Minimum="0"
+                                Minimum="-50"
                                 Maximum="100"
                                 Value="0"
                                 TickFrequency="1"
                                 IsSnapToTickEnabled="True"
                                 SmallChange="1"
-                                LargeChange="5"
-                                ToolTip="0 = normaler Text-Gamma; höher = minimal verstärkter Gamma-Wert nur für Text (Gesamtbild unverändert)"
+                                LargeChange="10"
+                                ToolTip="0 = Normal; negativ (-50) = feinere/dünnere Schrift (mehr Luft bei fetter oder heller Schrift); positiv (+100) = kräftigere Schrift"
                                 ValueChanged="GammaSlider_ValueChanged"/>
                     </StackPanel>
                 </GroupBox>
@@ -240,16 +242,44 @@
                                   FontSize="12"
                                   Checked="VectorTextEnabled_Changed"
                                   Unchecked="VectorTextEnabled_Changed"/>
-                        <CheckBox x:Name="InvertColorsCheckBox"
-                                  Content="Farben invertieren (Strg+Alt+I)"
-                                  IsChecked="False"
-                                  Foreground="#FFE2E8F0"
-                                  FontWeight="Normal"
+                        <TextBlock Text="Farb- &amp; Lesemodus (Strg+Alt+I):"
+                                   Foreground="#FFCBD5E1"
+                                   FontWeight="Normal"
+                                   FontSize="12"
+                                   Margin="0,8,0,0"/>
+                        <ComboBox x:Name="ColorModeComboBox"
+                                  SelectedIndex="0"
+                                  Background="#FFE2E8F0"
+                                  Foreground="#FF0F172A"
                                   FontSize="12"
-                                  Margin="0,6,0,0"
-                                  ToolTip="Invertiert alle Bildschirmfarben (Weiß wird Schwarz, Schwarz wird Weiß) – auch per Strg+Alt+I umschaltbar"
-                                  Checked="InvertColors_Changed"
-                                  Unchecked="InvertColors_Changed"/>
+                                  FontWeight="SemiBold"
+                                  Margin="0,3,0,0"
+                                  ToolTip="Farb- und Lesefilter (z. B. Gelb auf Schwarz oder Sepia für langes Lesen)"
+                                  SelectionChanged="ColorModeComboBox_SelectionChanged">
+                            <ComboBoxItem Content="Normal" Foreground="#FF0F172A"/>
+                            <ComboBoxItem Content="Invertiert (Schwarz/Weiß)" Foreground="#FF0F172A"/>
+                            <ComboBoxItem Content="Gelb auf Schwarz (Lesemodus)" Foreground="#FF0F172A"/>
+                            <ComboBoxItem Content="Weiß auf Blau (Lesemodus)" Foreground="#FF0F172A"/>
+                            <ComboBoxItem Content="Sepia (Blendschutz)" Foreground="#FF0F172A"/>
+                        </ComboBox>
+                        <TextBlock Text="Bilder &amp; Videos:"
+                                   Foreground="#FFCBD5E1"
+                                   FontWeight="Normal"
+                                   FontSize="12"
+                                   Margin="0,8,0,0"/>
+                        <ComboBox x:Name="MediaModeComboBox"
+                                  SelectedIndex="0"
+                                  Background="#FFE2E8F0"
+                                  Foreground="#FF0F172A"
+                                  FontSize="12"
+                                  FontWeight="SemiBold"
+                                  Margin="0,3,0,0"
+                                  ToolTip="Steuert die automatische Bild/Video-Erkennung (Sharp-Bilinear vs. Glättung)"
+                                  SelectionChanged="MediaModeComboBox_SelectionChanged">
+                            <ComboBoxItem Content="Auto (Bild/Video nativ)" Foreground="#FF0F172A"/>
+                            <ComboBoxItem Content="Immer nativ (Sharp-Bilinear)" Foreground="#FF0F172A"/>
+                            <ComboBoxItem Content="Aus (alles glätten)" Foreground="#FF0F172A"/>
+                        </ComboBox>
                         <TextBlock x:Name="HookStatusText"
                                    Text="Hook-Status: Bereit | Empfangene Texte: 0"
                                    Foreground="#FF94A3B8"
